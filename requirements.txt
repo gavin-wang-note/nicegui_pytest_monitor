@@ -1,0 +1,7 @@
+nicegui
+psutil
+pytest
+pytest-html
+allure-pytest
+pydantic
+python-dotenv
