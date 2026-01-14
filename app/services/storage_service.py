@@ -1,9 +1,13 @@
 import sqlite3
 import os
+import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from app.models import SystemData, TestResult, TestRun, TestQueueItem, TestLog
 from config.settings import settings
+
+# 获取日志记录器
+logger = logging.getLogger('RemoteTestMonitor.StorageService')
 
 class StorageService:
     def __init__(self):
@@ -47,9 +51,16 @@ class StorageService:
                     skipped_tests INTEGER DEFAULT 0,
                     test_path TEXT NOT NULL,
                     report_path TEXT,
-                    node_name TEXT NOT NULL DEFAULT 'localhost'
+                    node_name TEXT NOT NULL DEFAULT 'localhost',
+                    exit_code INTEGER
                 )
             ''')
+            
+            # 如果 exit_code 列不存在，添加它
+            try:
+                cursor.execute('ALTER TABLE test_runs ADD COLUMN exit_code INTEGER')
+            except sqlite3.OperationalError:
+                pass  # 列已存在
             
             # 创建测试结果表
             cursor.execute('''
@@ -139,14 +150,60 @@ class StorageService:
                 ) for row in rows
             ]
     
+    def get_running_tests(self) -> List[TestRun]:
+        """获取所有正在运行的测试（只返回真正活跃的测试）"""
+        current_time = datetime.now()
+        cutoff_time = current_time - timedelta(hours=1)  # 1小时前
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code
+                FROM test_runs
+                WHERE status = 'running'
+                  AND start_time > ?
+                ORDER BY start_time DESC
+            ''', (cutoff_time.isoformat(),))
+            
+            rows = cursor.fetchall()
+            active_tests = []
+            
+            for row in rows:
+                test_run = TestRun(
+                    run_id=row[0],
+                    start_time=datetime.fromisoformat(row[1]),
+                    end_time=datetime.fromisoformat(row[2]) if row[2] else None,
+                    status=row[3],
+                    total_tests=row[4],
+                    passed_tests=row[5],
+                    failed_tests=row[6],
+                    skipped_tests=row[7],
+                    test_path=row[8],
+                    report_path=row[9],
+                    node_name=row[10],
+                    exit_code=row[11]
+                )
+                
+                # 进一步过滤：只保留有实际测试进展的测试
+                has_progress = (test_run.total_tests > 0 or 
+                              test_run.passed_tests > 0 or 
+                              test_run.failed_tests > 0 or 
+                              test_run.skipped_tests > 0)
+                
+                if has_progress or (current_time - test_run.start_time).total_seconds() < 600:  # 10分钟内开始的
+                    active_tests.append(test_run)
+            
+            print(f"筛选后的活跃测试数量: {len(active_tests)}")
+            return active_tests
+    
     def save_test_run(self, test_run: TestRun):
         """保存测试运行数据"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT OR REPLACE INTO test_runs 
-                (run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 test_run.run_id,
                 test_run.start_time.isoformat(),
@@ -158,7 +215,8 @@ class StorageService:
                 test_run.skipped_tests,
                 test_run.test_path,
                 test_run.report_path,
-                test_run.node_name
+                test_run.node_name,
+                test_run.exit_code
             ))
             conn.commit()
     
@@ -167,7 +225,7 @@ class StorageService:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name
+                SELECT run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code
                 FROM test_runs
                 WHERE run_id = ?
             ''', (run_id,))
@@ -185,7 +243,8 @@ class StorageService:
                     skipped_tests=row[7],
                     test_path=row[8],
                     report_path=row[9],
-                    node_name=row[10]
+                    node_name=row[10],
+                    exit_code=row[11]
                 )
             return None
     
@@ -323,26 +382,38 @@ class StorageService:
                 ) for row in rows
             ]
     
-    def delete_test_run(self, run_id: str):
-        """删除测试运行记录"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM test_runs WHERE run_id = ?', (run_id,))
+    def delete_test_run(self, run_id: str) -> bool:
+        """删除指定测试运行记录"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # 删除相关的测试日志
+                cursor.execute('DELETE FROM test_logs WHERE run_id = ?', (run_id,))
+                
+                # 删除相关的测试结果
+                cursor.execute('DELETE FROM test_results WHERE run_id = ?', (run_id,))
+                
+                # 删除测试运行记录
+                cursor.execute('DELETE FROM test_runs WHERE run_id = ?', (run_id,))
+                
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"删除测试运行记录失败: {str(e)}")
+            return False
     
-    def delete_test_logs(self, run_id: str):
-        """删除测试日志记录"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM test_logs WHERE run_id = ?', (run_id,))
-    
-    def delete_test_run_and_logs(self, run_id: str):
-        """删除测试运行记录和相关日志"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            # 删除测试日志
-            cursor.execute('DELETE FROM test_logs WHERE run_id = ?', (run_id,))
-            # 删除测试运行记录
-            cursor.execute('DELETE FROM test_runs WHERE run_id = ?', (run_id,))
+    def delete_test_logs(self, run_id: str) -> bool:
+        """删除指定测试运行的所有日志"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM test_logs WHERE run_id = ?', (run_id,))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"删除测试日志失败: {str(e)}")
+            return False
     
     def export_to_csv(self, table_name: str, file_path: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None):
         """导出数据到CSV文件"""

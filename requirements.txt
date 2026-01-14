@@ -5,3 +5,4 @@ pytest-html
 allure-pytest
 pydantic
 python-dotenv
+pydantic_settings

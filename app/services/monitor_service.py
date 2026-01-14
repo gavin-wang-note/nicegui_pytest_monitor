@@ -100,6 +100,7 @@ class MonitorService:
             else:
                 # 进程不存在，重置目标进程ID
                 self._target_process_id = None
+                memory_percent = memory.percent
         else:
             # 使用系统级资源
             memory_percent = memory.percent

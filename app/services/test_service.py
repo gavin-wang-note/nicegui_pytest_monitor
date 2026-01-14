@@ -2,6 +2,7 @@ import subprocess
 import threading
 import time
 import uuid
+import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import os
@@ -11,6 +12,9 @@ from app.services.monitor_service import monitor_service
 from app.utils.process_utils import ProcessUtils
 from config.settings import settings
 
+# 获取日志记录器
+logger = logging.getLogger('RemoteTestMonitor.TestService')
+
 class TestService:
     def __init__(self):
         self._current_test_run: Optional[Dict[str, Any]] = None
@@ -19,6 +23,9 @@ class TestService:
         self._test_status_callbacks = []
         self._processing_queue = False
         self._queue_thread = None
+        
+        # 初始化时清理卡住的测试
+        self._cleanup_stuck_tests()
     
     def start_test(self, test_path: str) -> str:
         """开始执行测试"""
@@ -51,19 +58,23 @@ class TestService:
     
     def _execute_test(self, run_id: str, test_path: str):
         """执行测试的内部方法"""
-        # 确保报告目录存在
         os.makedirs(settings.TEST_REPORTS_PATH, exist_ok=True)
         
-        # 构建测试命令
-        report_path = os.path.join(settings.TEST_REPORTS_PATH, f"report_{run_id}.html")
+        log_file_path = os.path.join(settings.TEST_REPORTS_PATH, f"{run_id}.log")
+        report_path = os.path.join(settings.TEST_REPORTS_PATH, f"{run_id}_report.html")
+        
+        log_file = open(log_file_path, 'w', encoding='utf-8')
+        
         test_command = [
             "python", "-m", "pytest",
             test_path,
             "-v",
-            f"--html={report_path}"
+            "--tb=short",
+            "--durations=10",
+            f"--html={report_path}",
+            "--self-contained-html"
         ]
         
-        # 启动测试进程
         process = subprocess.Popen(
             test_command,
             stdout=subprocess.PIPE,
@@ -72,25 +83,22 @@ class TestService:
             bufsize=1
         )
         
-        # 记录当前测试运行信息
         self._current_test_run = {
             "run_id": run_id,
             "process": process,
-            "report_path": report_path
+            "report_path": report_path,
+            "log_file_path": log_file_path
         }
         
-        # 开始监控测试进程资源
         monitor_service.monitor_external_process(process.pid)
         
-        # 启动日志读取线程
         log_thread = threading.Thread(
             target=self._read_test_logs, 
-            args=(run_id, process),
+            args=(run_id, process, log_file),
             daemon=True
         )
         log_thread.start()
         
-        # 启动状态监控线程
         status_thread = threading.Thread(
             target=self._monitor_test_status, 
             args=(run_id, process, report_path),
@@ -98,218 +106,226 @@ class TestService:
         )
         status_thread.start()
     
-    def _read_test_logs(self, run_id: str, process: subprocess.Popen):
+    def _read_test_logs(self, run_id: str, process: subprocess.Popen, log_file):
         """读取测试日志并解析测试统计"""
-        total_tests = 0
-        passed_tests = 0
-        failed_tests = 0
-        skipped_tests = 0
-        
-        # 同时读取stdout和stderr
-        import threading
-        
-        def read_stream(stream, stream_name):
-            """读取单个流的输出"""
-            for line in iter(stream.readline, ''):
+        logger.info(f"日志读取线程已启动: run_id={run_id}")
+
+        if process.stdout:
+            line_count = 0
+            for line in iter(process.stdout.readline, ''):
                 line = line.strip()
                 if line:
-                    self._process_log_line(run_id, line, stream_name)
+                    line_count += 1
+                    log_line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {line}\n"
+
+                    try:
+                        log_file.write(log_line)
+                        log_file.flush()
+                        logger.debug(f"日志已写入文件 #{line_count}: {line[:50]}...")
+                    except Exception as e:
+                        logger.error(f"写入日志文件失败: {e}")
+
+                    test_log = TestLog(
+                        run_id=run_id,
+                        timestamp=datetime.now(),
+                        level=self._determine_log_level(line),
+                        message=line
+                    )
+                    storage_service.save_test_log(test_log)
+
+                    # 触发日志回调
+                    self._trigger_log_callbacks(test_log)
+                    logger.debug(f"日志回调已触发 #{line_count}: {line[:50]}...")
+
+                    # 解析单个测试用例结果并更新统计
+                    self._parse_test_result_line(line, run_id)
                     
-                    # 解析测试统计信息（通常在最后几行）
-                    self._parse_test_statistics(run_id, line, stream_name)
-        
-        # 启动线程读取stdout
-        if process.stdout:
-            stdout_thread = threading.Thread(
-                target=read_stream,
-                args=(process.stdout, 'stdout'),
-                daemon=True
-            )
-            stdout_thread.start()
-        
-        # 启动线程读取stderr  
-        if process.stderr:
-            stderr_thread = threading.Thread(
-                target=read_stream,
-                args=(process.stderr, 'stderr'),
-                daemon=True
-            )
-            stderr_thread.start()
-        
-        # 等待线程完成
-        if process.stdout:
-            process.stdout.close()
-        if process.stderr:
-            process.stderr.close()
-        
-        # 等待子进程结束
-        process.wait()
-        
-        # 强制更新最终统计数据
-        self._update_test_statistics(run_id, total_tests, passed_tests, failed_tests, skipped_tests)
+                    # 解析测试汇总统计
+                    self._parse_test_statistics(line, run_id)
+            
+            logger.info(f"日志读取完成，共读取 {line_count} 行日志")
+            
+            try:
+                log_file.close()
+                logger.info(f"日志文件已关闭: {log_file.name}")
+            except Exception as e:
+                logger.error(f"关闭日志文件失败: {e}")
+                
+        process.stdout.close()
     
-    def _parse_test_statistics(self, run_id: str, line: str, stream_name: str):
+    def _determine_log_level(self, line: str) -> str:
+        """根据日志内容确定日志级别"""
+        line_upper = line.upper()
+        if " FAILED" in line_upper or " ERROR" in line_upper or " FAILED\t" in line_upper:
+            return "ERROR"
+        elif "WARNING" in line_upper or "WARN" in line_upper:
+            return "WARNING"
+        return "INFO"
+    
+    def _parse_test_result_line(self, line: str, run_id: str):
+        """解析单个测试用例结果行，动态更新统计"""
+        import re
+        
+        line_stripped = line.strip()
+        
+        if not line_stripped:
+            return
+        
+        pattern_passed = r'^[✅✔✓]\s*通过[:：]\s*.+'
+        pattern_failed = r'^[❌✗×]\s*失败[:：]\s*.+'
+        
+        is_passed = bool(re.match(pattern_passed, line_stripped))
+        is_failed = bool(re.match(pattern_failed, line_stripped))
+        
+        if not is_passed and not is_failed:
+            return
+        
+        print(f"[Parse] 匹配到测试结果行: {line_stripped[:60]}...")
+        
+        test_run = storage_service.get_test_run(run_id)
+        if not test_run:
+            print(f"[Parse] 错误：找不到测试记录 {run_id}")
+            return
+        
+        old_passed = test_run.passed_tests
+        old_failed = test_run.failed_tests
+        old_skipped = test_run.skipped_tests
+        
+        if is_passed:
+            test_run.passed_tests += 1
+            print(f"[Parse] 检测到通过用例")
+        elif is_failed:
+            test_run.failed_tests += 1
+            print(f"[Parse] 检测到失败用例")
+        
+        test_run.total_tests = test_run.passed_tests + test_run.failed_tests + test_run.skipped_tests
+        storage_service.save_test_run(test_run)
+        
+        print(f"[Parse] 统计更新: 通过 {old_passed}->{test_run.passed_tests}, 失败 {old_failed}->{test_run.failed_tests}, 跳过 {old_skipped}->{test_run.skipped_tests}")
+        
+        self._trigger_status_callbacks(test_run)
+    
+    def _parse_test_statistics(self, line: str, run_id: str):
         """解析测试统计信息"""
         import re
         
-        # 匹配各种pytest输出格式
-        # 格式1: "3 passed, 1 failed, 2 skipped in 10.50s"
-        # 格式2: "1 failed in 5.20s" 
-        # 格式3: "3 passed in 8.30s"
-        # 格式4: "2 failed, 1 skipped in 12.34s"
+        line_lower = line.lower().strip()
         
-        total_tests = 0
-        passed_tests = 0
-        failed_tests = 0
-        skipped_tests = 0
+        if '=' not in line_lower:
+            return
         
-        # 使用正则表达式匹配测试统计格式
-        patterns = [
-            r'(\d+)\s+passed.*?(\d+)\s+failed.*?(\d+)\s+skipped',
-            r'(\d+)\s+passed.*?(\d+)\s+failed',
-            r'(\d+)\s+failed.*?(\d+)\s+skipped',
-            r'(\d+)\s+passed.*?(\d+)\s+skipped',
-            r'(\d+)\s+passed',
-            r'(\d+)\s+failed',
-            r'(\d+)\s+skipped',
-        ]
+        summary_match = re.search(r'=+\s*(.+?)\s*=+\s*$', line_lower)
+        if not summary_match:
+            return
         
-        matched = False
-        for pattern in patterns:
-            match = re.search(pattern, line)
-            if match:
-                matched = True
-                groups = match.groups()
-                
-                # 根据匹配的格式提取数据
-                if len(groups) == 3:  # 包含pass, fail, skip
-                    passed_tests = int(groups[0])
-                    failed_tests = int(groups[1])
-                    skipped_tests = int(groups[2])
-                elif len(groups) == 2:  # 包含两种统计
-                    # 判断是passed+failed还是failed+skip等
-                    if "passed" in line and "failed" in line:
-                        passed_tests = int(groups[0])
-                        failed_tests = int(groups[1])
-                    elif "failed" in line and "skipped" in line:
-                        failed_tests = int(groups[0])
-                        skipped_tests = int(groups[1])
-                    elif "passed" in line and "skipped" in line:
-                        passed_tests = int(groups[0])
-                        skipped_tests = int(groups[1])
-                elif len(groups) == 1:  # 只有一种统计
-                    if "passed" in line:
-                        passed_tests = int(groups[0])
-                    elif "failed" in line:
-                        failed_tests = int(groups[0])
-                    elif "skipped" in line:
-                        skipped_tests = int(groups[0])
-                break
+        summary_text = summary_match.group(1)
+        print(f"[Summary] 解析汇总文本: {summary_text}")
         
-        # 如果没有匹配到，尝试手动解析
-        if not matched and ("passed" in line or "failed" in line or "skipped" in line):
-            try:
-                # 简单的字符串分割解析
-                parts = line.replace(" in ", " ").split(",")
-                for part in parts:
-                    part = part.strip()
-                    if "passed" in part:
-                        # 提取数字
-                        numbers = re.findall(r'\d+', part)
-                        if numbers:
-                            passed_tests = int(numbers[0])
-                    elif "failed" in part:
-                        numbers = re.findall(r'\d+', part)
-                        if numbers:
-                            failed_tests = int(numbers[0])
-                    elif "skipped" in part:
-                        numbers = re.findall(r'\d+', part)
-                        if numbers:
-                            skipped_tests = int(numbers[0])
-            except Exception as e:
-                print(f"手动解析失败: {e}")
-        
-        total_tests = passed_tests + failed_tests + skipped_tests
-        
-        # 更新测试统计数据（只有当有实际数据时才更新）
-        if total_tests > 0:
-            self._update_test_statistics(run_id, total_tests, passed_tests, failed_tests, skipped_tests)
-            print(f"更新统计数据: 总数={total_tests}, 通过={passed_tests}, 失败={failed_tests}, 跳过={skipped_tests} (来源: {stream_name})")
-        elif matched:
-            print(f"匹配到统计行但解析失败: {line}")
-    
-    def _process_log_line(self, run_id: str, line: str, stream_name: str):
-        """处理单行日志"""
-        # 确定日志级别
-        log_level = "INFO"
-        if "FAILED" in line.upper() or "ERROR" in line.upper():
-            log_level = "ERROR"
-        elif "WARNING" in line.upper() or "WARN" in line.upper():
-            log_level = "WARNING"
-        elif "DEBUG" in line.upper():
-            log_level = "DEBUG"
-        
-        # 创建日志记录
-        test_log = TestLog(
-            run_id=run_id,
-            timestamp=datetime.now(),
-            level=log_level,
-            message=line
-        )
-        
-        # 保存日志
-        storage_service.save_test_log(test_log)
-        
-        # 触发日志回调
-        self._trigger_log_callbacks(test_log)
+        try:
+            passed_tests_local = 0
+            failed_tests_local = 0
+            skipped_tests_local = 0
+            
+            passed_match = re.search(r'(\d+)\s+passed', summary_text)
+            failed_match = re.search(r'(\d+)\s+failed', summary_text)
+            skipped_match = re.search(r'(\d+)\s+skipped', summary_text)
+            
+            if passed_match:
+                passed_tests_local = int(passed_match.group(1))
+                print(f"[Summary] 解析到 passed: {passed_tests_local}")
+            
+            if failed_match:
+                failed_tests_local = int(failed_match.group(1))
+                print(f"[Summary] 解析到 failed: {failed_tests_local}")
+            
+            if skipped_match:
+                skipped_tests_local = int(skipped_match.group(1))
+                print(f"[Summary] 解析到 skipped: {skipped_tests_local}")
+            
+            if passed_tests_local > 0 or failed_tests_local > 0 or skipped_tests_local > 0:
+                total_tests_local = passed_tests_local + failed_tests_local + skipped_tests_local
+                print(f"[Summary] 汇总统计: 通过={passed_tests_local}, 失败={failed_tests_local}, 跳过={skipped_tests_local}, 总数={total_tests_local}")
+                self._update_test_statistics(run_id, total_tests_local, passed_tests_local, failed_tests_local, skipped_tests_local)
+        except Exception as e:
+            print(f"[Summary] 解析统计失败: {e}")
     
     def _update_test_statistics(self, run_id: str, total_tests: int, passed_tests: int, failed_tests: int, skipped_tests: int):
         """更新测试统计数据"""
+        logger.debug(f"更新测试统计: run_id={run_id}, 总数={total_tests}, 通过={passed_tests}, 失败={failed_tests}, 跳过={skipped_tests}")
         test_run = storage_service.get_test_run(run_id)
         if test_run:
+            logger.debug(f"更新前的测试状态: {test_run.status}")
             test_run.total_tests = total_tests
             test_run.passed_tests = passed_tests
             test_run.failed_tests = failed_tests
             test_run.skipped_tests = skipped_tests
             storage_service.save_test_run(test_run)
+            logger.debug("测试统计已保存到数据库")
             
             # 触发状态回调以更新UI
             self._trigger_status_callbacks(test_run)
+            logger.debug("状态回调已触发，UI将更新")
+        else:
+            logger.error(f"错误：找不到测试运行记录来更新统计: run_id={run_id}")
     
     def _monitor_test_status(self, run_id: str, process: subprocess.Popen, report_path: str):
         """监控测试状态"""
-        process.wait()
-        
-        # 停止监控该进程
-        monitor_service.stop_monitoring_process()
-        
-        # 更新测试状态
-        if process.returncode == 0:
-            status = "completed"
-        else:
-            status = "failed"
-        
-        self._update_test_status(run_id, status, report_path)
-        
-        # 清理当前测试运行信息
-        self._current_test_run = None
-        
-        # 处理下一个队列项
-        self._process_next_in_queue()
+        try:
+            exit_code = process.wait()
+            print(f"[Monitor] 测试结束: run_id={run_id}, exit={exit_code}")
+            
+            test_run = storage_service.get_test_run(run_id)
+            if test_run:
+                total = test_run.passed_tests + test_run.failed_tests
+                success_rate = (test_run.passed_tests / total * 100) if total > 0 else 0
+                
+                if exit_code == 0 or (exit_code == 1 and success_rate >= 95):
+                    self._update_test_status(run_id, "completed", report_path, exit_code)
+                else:
+                    self._update_test_status(run_id, "failed", report_path, exit_code)
+        except Exception as e:
+            print(f"[Monitor] Error: {e}")
+            try:
+                self._update_test_status(run_id, "failed", report_path)
+            except:
+                pass
     
-    def _update_test_status(self, run_id: str, status: str, report_path: Optional[str] = None):
+    def _cleanup_stuck_tests(self):
+        """清理卡在running状态的测试记录"""
+        logger.debug("检查卡在running状态的测试...")
+        all_tests = storage_service.get_all_test_runs()
+        current_time = datetime.now()
+        
+        for test_run in all_tests:
+            # 检查是否是卡住的测试（running状态但统计为0，且开始时间超过30分钟）
+            if (test_run.status == 'running' and 
+                test_run.total_tests == 0 and 
+                test_run.passed_tests == 0 and 
+                test_run.failed_tests == 0 and 
+                test_run.skipped_tests == 0):
+                
+                # 检查运行时间
+                time_diff = (current_time - test_run.start_time).total_seconds()
+                if time_diff > 1800:  # 30分钟
+                    logger.debug(f"清理卡住的测试: run_id={test_run.run_id}, 运行时间={time_diff:.0f}秒")
+                    self._update_test_status(test_run.run_id, "failed", test_run.report_path, -1)
+    
+    def _update_test_status(self, run_id: str, status: str, report_path: Optional[str] = None, exit_code: Optional[int] = None):
         """更新测试状态"""
         existing_test_run = storage_service.get_test_run(run_id)
         if existing_test_run:
-            # 只更新状态相关字段，保留已解析的统计数据
+            print(f"[Status] 更新状态: run_id={run_id}, {existing_test_run.status} -> {status}")
             existing_test_run.status = status
             existing_test_run.end_time = datetime.now()
             if report_path:
                 existing_test_run.report_path = report_path
+            if exit_code is not None:
+                existing_test_run.exit_code = exit_code
             storage_service.save_test_run(existing_test_run)
             
-            # 触发状态回调
             self._trigger_status_callbacks(existing_test_run)
+        else:
+            print(f"[Status] 错误：找不到测试运行记录: run_id={run_id}")
     
     def add_to_queue(self, test_path: str, priority: int = 0) -> str:
         """添加测试到队列"""

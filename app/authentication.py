@@ -60,16 +60,6 @@ class Authentication:
                     else:
                         error_label.text = '用户名或密码错误'
                 
-                # 添加按回车键登录功能
-                def on_enter_key(e):
-                    if e.key == 'Enter':
-                        handle_login()
-                
-                # 为用户名输入框添加回车键事件
-                username_input.on('keydown.enter', on_enter_key)
-                # 为密码输入框添加回车键事件
-                password_input.on('keydown.enter', on_enter_key)
-                
                 ui.button('登录', on_click=handle_login).classes('w-full')
 
 # 创建全局认证实例

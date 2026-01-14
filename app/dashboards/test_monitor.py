@@ -1,18 +1,25 @@
+import asyncio
 import os
-import webbrowser
+import logging
 
 from nicegui import ui, app
 from typing import List, Dict, Any
 from datetime import datetime
 from app.models import TestLog, TestRun
 from app.services import test_service, storage_service
+from config.settings import settings
+
+# 获取日志记录器
+logger = logging.getLogger('RemoteTestMonitor.TestMonitor')
 
 
 class TestMonitor:
     def __init__(self):
         self.current_run_id = None
         self.test_logs = []
-        self.max_log_lines = 500  # 最大日志行数
+        self.max_log_lines = 500   # 最大日志行数
+        self.refresh_timer = None  # 自动刷新定时器
+        self.refresh_interval = 2  # 刷新间隔（秒）
     
     def create_dashboard(self):
         """创建测试监控仪表板"""
@@ -23,6 +30,7 @@ class TestMonitor:
             with ui.row().classes('w-full mb-4'):
                 self.test_path_input = ui.input(
                     label='测试路径',
+                    value='./tests',  # 添加默认值用于测试
                     placeholder='例如: ./tests 或 tests/test_example.py'
                 ).classes('flex-grow mr-2')
                 
@@ -50,7 +58,9 @@ class TestMonitor:
             with ui.card().classes('w-full mt-4'):
                 with ui.row().classes('w-full justify-between items-center mb-2'):
                     ui.label('测试报告').classes('text-lg font-semibold')
-                    self.refresh_button = ui.button('刷新', on_click=self._load_reports, icon='refresh').props('flat')
+                    with ui.row().classes('items-center'):
+                        self.auto_refresh_status = ui.badge('自动刷新: 关闭', color='gray').classes('mr-2')
+                        self.refresh_button = ui.button('刷新', on_click=self._load_reports, icon='refresh').props('flat')
                 
                 self.report_list = ui.list().classes('w-full')
                 self._load_reports()
@@ -59,31 +69,115 @@ class TestMonitor:
         test_service.register_log_callback(self._update_log)
         test_service.register_status_callback(self._update_test_status)
     
+    def _start_auto_refresh(self):
+        """开始自动刷新"""
+        if self.refresh_timer is None:
+            self.refresh_timer = ui.timer(self.refresh_interval, self._auto_refresh, active=True)
+            # 更新自动刷新状态显示
+            self.auto_refresh_status.text = f'自动刷新: 开启 ({self.refresh_interval}s)'
+            self.auto_refresh_status.props('color=green')
+            logger.debug(f"自动刷新已启动，间隔: {self.refresh_interval}秒")
+    
+    def _stop_auto_refresh(self):
+        """停止自动刷新"""
+        if self.refresh_timer:
+            self.refresh_timer.deactivate()
+            self.refresh_timer = None
+            # 更新自动刷新状态显示
+            self.auto_refresh_status.text = '自动刷新: 关闭'
+            self.auto_refresh_status.props('color=gray')
+            logger.debug("自动刷新已停止")
+    
+    def _auto_refresh(self):
+        """自动刷新逻辑 - 检查是否有正在运行的测试"""
+        running_tests = storage_service.get_running_tests()
+        logger.debug(f"自动刷新检查 - 运行中测试数量: {len(running_tests)}")
+        
+        if running_tests:
+            logger.debug(f"检测到 {len(running_tests)} 个运行中的测试，自动刷新...")
+            # 强制刷新UI和数据
+            self._force_refresh_reports()
+        else:
+            logger.debug("没有检测到运行中的测试，先刷新报告列表更新状态...")
+            self._load_reports()
+            self._stop_auto_refresh()
+    
+    def _force_refresh_reports(self):
+        """强制刷新报告列表和统计数据"""
+        logger.debug("执行强制刷新...")
+        
+        # 获取所有测试运行
+        all_tests = storage_service.get_all_test_runs()
+        logger.debug(f"数据库中总共有 {len(all_tests)} 个测试运行")
+        
+        for test in all_tests:
+            logger.debug(f"  - 测试运行: run_id={test.run_id}, status={test.status}, 总数={test.total_tests}, 通过={test.passed_tests}, 失败={test.failed_tests}, 跳过={test.skipped_tests}")
+        
+        # 刷新UI显示
+        self._load_reports()
+    
     def _start_test(self):
         """开始执行测试"""
+        # 调试信息
+        raw_value = self.test_path_input.value
+        logger.debug(f"原始输入值: '{raw_value}' (长度: {len(raw_value)})")
+        logger.debug(f"字符编码: {[ord(c) for c in raw_value]}")
+        
         test_path = self.test_path_input.value.strip()
+        logger.debug(f"清理后路径: '{test_path}' (长度: {len(test_path)})")
+        
         if not test_path:
             ui.notify('请输入测试路径', type='warning')
+            logger.debug("路径为空，停止测试")
+            return
+        
+        # 检测路径是否存在
+        if not os.path.exists(test_path):
+            ui.notify(f'路径不存在，请检查输入的路径是否正确:\n{test_path}', type='warning', duration=5)
+            logger.warning(f"路径不存在: {test_path}")
+            return
+        
+        # 检测路径是否为目录
+        if not os.path.isdir(test_path):
+            ui.notify(f'路径指向的不是目录，请选择一个有效的测试目录:\n{test_path}', type='warning', duration=5)
+            logger.warning(f"路径不是目录: {test_path}")
             return
         
         try:
             # 开始测试
             self.current_run_id = test_service.start_test(test_path)
+            print(f"[DEBUG] 测试已启动: run_id={self.current_run_id}")
+            print(f"[DEBUG] self.test_status 对象存在: {self.test_status is not None}")
+            
+            # 启动自动刷新
+            self._start_auto_refresh()
+            
+            # 立即刷新报告列表以显示新测试
+            self._load_reports()
             
             # 更新UI状态
             self.start_button.disable()
             self.stop_button.enable()
+            print(f"[DEBUG] 更新UI状态: test_status.text = '测试正在执行...'")
             self.test_status.text = f'测试正在执行... (Run ID: {self.current_run_id})'
+            print(f"[DEBUG] 更新后的text值: {self.test_status.text}")
             self.test_status.classes(remove='text-red-500 text-green-500').classes('text-blue-500')
+            print(f"[DEBUG] UI状态更新完成")
             
             ui.notify(f'测试已开始: {test_path}', type='success')
         except Exception as e:
+            print(f"[DEBUG] 测试启动异常: {e}")
+            import traceback
+            traceback.print_exc()
             ui.notify(f'测试启动失败: {str(e)}', type='error')
     
     def _stop_test(self):
         """停止正在执行的测试"""
         if self.current_run_id:
             if test_service.stop_test(self.current_run_id):
+                # 停止自动刷新
+                self._stop_auto_refresh()
+                
                 # 更新UI状态
                 self.start_button.enable()
                 self.stop_button.disable()
@@ -96,77 +190,140 @@ class TestMonitor:
     
     def _update_log(self, test_log: TestLog):
         """更新测试日志"""
-        # 只显示当前测试的日志
-        if not self.current_run_id or test_log.run_id != self.current_run_id:
+        print(f"[DEBUG] _update_log 被调用: run_id={test_log.run_id}, current_run_id={self.current_run_id}")
+        
+        if not self.current_run_id:
+            print(f"[DEBUG] current_run_id 为 None，自动设置为当前日志的 run_id")
+            self.current_run_id = test_log.run_id
+        
+        if test_log.run_id != self.current_run_id:
+            print(f"[DEBUG] 日志被跳过: run_id不匹配 ({test_log.run_id} != {self.current_run_id})")
             return
         
-        # 添加日志到输出
-        self.log_output.push(f"[{test_log.timestamp.strftime('%H:%M:%S')}] {test_log.message}")
+        self.test_logs.append(test_log)
         
-        # 限制日志行数
-        if len(self.log_output.lines) > self.max_log_lines:
-            self.log_output.lines = self.log_output.lines[-self.max_log_lines:]
+        log_message = f"[{test_log.timestamp.strftime('%H:%M:%S')}] {test_log.message}"
+        print(f"[DEBUG] 推送日志到UI: {log_message[:50]}...")
+        
+        async def update_ui():
+            print(f"[DEBUG] 执行UI更新: {log_message[:50]}...")
+            try:
+                self.log_output.push(log_message)
+                print(f"[DEBUG] UI日志更新成功，当前日志数量: {len(self.test_logs)}")
+            except Exception as e:
+                print(f"日志输出失败: {e}")
+            
+            if len(self.test_logs) > self.max_log_lines:
+                try:
+                    self.log_output.clear()
+                    for log in self.test_logs[-self.max_log_lines:]:
+                        log_msg = f"[{log.timestamp.strftime('%H:%M:%S')}] {log.message}"
+                        self.log_output.push(log_msg)
+                except Exception as e:
+                    print(f"清除日志失败: {e}")
+        
+        try:
+            loop = asyncio.get_running_loop()
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = asyncio.run_coroutine_threadsafe(update_ui(), loop)
+            result = future.result(timeout=5)
+        except Exception as e:
+            print(f"UI更新失败: {e}")
+            asyncio.run(update_ui())
     
     def _update_test_status(self, test_run: TestRun):
         """更新测试状态"""
-        if not self.current_run_id or test_run.run_id != self.current_run_id:
-            return
+        print(f"[STATUS-CB] _update_test_status 被调用: test_run.run_id={test_run.run_id}, self.current_run_id={self.current_run_id}, status={test_run.status}")
         
-        # 更新状态显示
-        if test_run.status == 'completed':
-            self.test_status.text = f'测试已完成 (Run ID: {test_run.run_id})'
-            self.test_status.classes(remove='text-blue-500 text-red-500').classes('text-green-500')
-            ui.notify('测试已完成', type='success')
-        elif test_run.status == 'failed':
-            self.test_status.text = f'测试失败 (Run ID: {test_run.run_id})'
-            self.test_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
-            ui.notify('测试失败', type='error')
-        elif test_run.status == 'stopped':
-            self.test_status.text = f'测试已停止 (Run ID: {test_run.run_id})'
-            self.test_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
-        
-        # 更新按钮状态
-        self.start_button.enable()
-        self.stop_button.disable()
-        
-        # 清空当前运行ID
-        self.current_run_id = None
-        
-        # 重新加载测试报告列表
-        self._load_reports()
-    
-    def _download_logs(self):
-        """下载测试日志"""
+        # 如果当前没有正在运行的测试，忽略状态回调（避免旧测试的状态干扰）
+        # 但是如果测试状态为 running，说明是新的测试开始了，设置 current_run_id
         if not self.current_run_id:
-            ui.notify('没有正在执行的测试', type='warning')
+            if test_run.status == 'running':
+                print(f"[STATUS-CB] current_run_id 为 None 但测试已开始，自动设置为当前测试 run_id")
+                self.current_run_id = test_run.run_id
+            else:
+                print(f"[STATUS-CB] current_run_id 为 None 且测试未运行，忽略状态回调")
+                return
+        
+        if test_run.run_id != self.current_run_id:
+            print(f"[DEBUG] run_id 不匹配，忽略状态回调")
             return
         
-        # 获取日志数据
-        logs = storage_service.get_test_logs(self.current_run_id)
-        if not logs:
-            ui.notify('没有日志数据', type='warning')
+        async def update_ui():
+            print(f"[DEBUG] update_ui 执行 - test_run.status={test_run.status}")
+            
+            # 根据状态更新UI
+            if test_run.status == 'completed':
+                self.test_status.text = f'测试已完成 (Run ID: {test_run.run_id})'
+                self.test_status.classes(remove='text-blue-500 text-red-500').classes('text-green-500')
+                ui.notify('测试已完成', type='success')
+            elif test_run.status == 'failed':
+                self.test_status.text = f'测试失败 (Run ID: {test_run.run_id})'
+                self.test_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
+                ui.notify('测试失败', type='error')
+            elif test_run.status == 'stopped':
+                self.test_status.text = f'测试已停止 (Run ID: {test_run.run_id})'
+                self.test_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
+            
+            # 停止自动刷新
+            self._stop_auto_refresh()
+            
+            # 恢复按钮状态
+            self.start_button.enable()
+            self.stop_button.disable()
+            
+            # 清除当前运行ID
+            print(f"[DEBUG] 清除 current_run_id: {self.current_run_id}")
+            self.current_run_id = None
+            
+            # 刷新报告列表
+            print(f"[DEBUG] 调用 _load_reports() 刷新UI")
+            self._load_reports()
+            print(f"[DEBUG] _load_reports() 执行完成")
+        
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(update_ui()))
+        except RuntimeError:
+            asyncio.run(update_ui())
+    
+    def _download_logs(self, run_id: str = None):
+        """下载测试日志"""
+        target_run_id = run_id or self.current_run_id
+        if not target_run_id:
+            ui.notify('请先选择一个测试记录', type='warning')
             return
         
-        # 生成日志内容
-        log_content = '\n'.join([
-            f"[{log.timestamp.strftime('%Y-%m-%d %H:%M:%S')}] {log.message}"
-            for log in logs
-        ])
+        log_file_path = os.path.join(settings.TEST_REPORTS_PATH, f"{target_run_id}.log")
         
-        # 创建下载链接
-        ui.download(
-            content=log_content,
-            filename=f'test_logs_{self.current_run_id}.txt',
-            mime_type='text/plain'
-        )
+        if not os.path.exists(log_file_path):
+            ui.notify(f'日志文件: {log_file_path} 不存在', type='warning', duration=5)
+            return
+        
+        if os.path.getsize(log_file_path) == 0:
+            ui.notify(f'日志文件: {log_file_path} 为空', type='info', duration=5)
+            return
+        
+        try:
+            if os.path.exists(log_file_path):
+                ui.download(
+                    src=log_file_path,
+                    filename=f'test_logs_{target_run_id}.txt',
+                    media_type='text/plain'
+                )
+            else:
+                ui.notify(f'日志文件: {log_file_path} 已被移动或删除', type='warning', duration=5)
+        except Exception as e:
+            ui.notify(f'下载日志失败: {str(e)}', type='error')
     
     def _load_reports(self):
         """加载测试报告列表"""
-        # 清空现有报告列表
-        self.report_list.clear()
+        logger.info("开始加载报告列表")
         
         # 从数据库获取所有测试运行记录
         test_runs = storage_service.get_all_test_runs()
+        logger.info(f"从数据库获取到 {len(test_runs)} 条测试记录")
         
         # 格式化数据为前端需要的格式
         reports = []
@@ -197,25 +354,85 @@ class TestMonitor:
                 'report_path': run.report_path
             })
         
-        # 如果没有报告数据，显示空状态
-        if not reports:
-            with self.report_list:
+        # 清空现有报告列表并重新渲染
+        logger.info("清空报告列表并重新渲染")
+        self.report_list.clear()
+        
+        # 立即渲染报告
+        self._render_reports(reports)
+    
+    def _render_reports(self, reports):
+        """渲染报告列表到UI"""
+        logger.info(f"开始渲染 {len(reports)} 个报告")
+        
+        with self.report_list:
+            # 如果没有报告数据，显示空状态
+            if not reports:
                 with ui.card().classes('w-full bg-gray-50'):
                     with ui.column().classes('w-full items-center p-4'):
                         ui.icon('article', size='48px', color='gray')
                         ui.label('暂无测试报告').classes('text-lg mt-2 text-gray-600')
                         ui.label('执行测试后将在这里显示报告').classes('text-sm text-gray-400')
-        else:
-            # 添加报告到列表，使用现代化样式
-            for report in reports:
-                with self.report_list:
+            else:
+                # 添加报告到列表，使用现代化样式
+                for report in reports:
+                    logger.info(f"渲染报告: {report['run_id']}")
                     with ui.card().classes('w-full mb-4 border rounded-lg shadow-sm hover:shadow-md transition-all duration-200'):
                         with ui.column().classes('p-3 w-full'):
+                            # 计算成功率，用于判断最终状态
+                            total = report['total_tests']
+                            passed = report['passed_tests']
+                            failed = report['failed_tests']
+                            skipped = report['skipped_tests']
+                            success_rate = (passed / (total - skipped) * 100) if (total - skipped) > 0 else 100
+                            
+                            # 根据数据库状态和成功率重新判断状态
+                            db_status = report['status']
+                            
+                            # 优先检查是否仍在运行中
+                            if db_status == 'running':
+                                effective_status = 'running'
+                            elif db_status == 'completed':
+                                # 只有测试真正完成时，才根据成功率判断最终状态
+                                if success_rate < 95:
+                                    effective_status = 'failed'
+                                else:
+                                    effective_status = 'completed'
+                            else:
+                                effective_status = db_status
+                            
                             # 标题行
                             with ui.row().classes('justify-between items-center w-full mb-2'):
                                 ui.label(f"测试: {report['test_path']}").classes('font-semibold text-lg')
-                                status_color = self._get_status_color(report['status'])
-                                ui.badge(report['status_display'], color=status_color)
+                                status_color = self._get_status_color(effective_status)
+                                if effective_status == 'running':
+                                    status_display = '运行中'
+                                elif effective_status == 'failed':
+                                    status_display = '失败'
+                                elif effective_status == 'completed':
+                                    if failed == 0:
+                                        status_display = '通过'
+                                    else:
+                                        status_display = '完成'
+                                else:
+                                    status_display = '完成'
+                                status_badge = ui.badge(status_display, color=status_color)
+                                
+                                # 根据实际状态添加悬浮提示
+                                if effective_status == 'running':
+                                    progress = ((passed + failed) / total * 100) if total > 0 else 0
+                                    status_badge.tooltip(f'测试运行中 - 已完成: {passed + failed} / {total} ({progress:.1f}%)')
+                                elif effective_status == 'completed':
+                                    if failed == 0:
+                                        status_badge.tooltip('测试通过 - 退出码为0，所有用例执行成功')
+                                    else:
+                                        status_badge.tooltip(f'测试完成 - 退出码为0且成功率≥95%({success_rate:.1f}%)，失败用例: {failed}个')
+                                elif effective_status == 'failed':
+                                    exit_code_info = report.get('exit_code', '')
+                                    if success_rate < 95:
+                                        status_badge.tooltip(f'测试失败 - 成功率<95%({success_rate:.1f}%)，失败用例: {failed}个')
+                                    else:
+                                        status_badge.tooltip(f'测试失败 - 退出码非0({exit_code_info})，成功率: {success_rate:.1f}%')
                             
                             # 详情行 - 网格布局
                             with ui.grid(columns=3).classes('w-full gap-2 text-sm text-gray-500'):
@@ -251,33 +468,63 @@ class TestMonitor:
                             
                             # 按钮行
                             with ui.row().classes('mt-3 w-full justify-between'):
-                                # 左侧：查看报告按钮
-                                with ui.row().classes('flex-grow-0'):
+                                # 左侧：查看报告按钮和下载日志按钮
+                                with ui.row().classes('flex-grow-0 gap-2'):
                                     if report['report_path']:
+                                        def create_view_handler(report_path, run_id):
+                                            def view_handler():
+                                                self._view_report(report_path, run_id)
+                                            return view_handler
+                                        
                                         view_button = ui.button(
                                             '查看报告',
-                                            on_click=lambda path=report['report_path']: self._view_report(path),
+                                            on_click=create_view_handler(report['report_path'], report['run_id']),
                                             color='primary',
                                             icon='article'
                                         ).props('flat rounded')
                                     else:
                                         ui.label('无报告文件').classes('text-gray-400')
+                                    
+                                    # 添加下载日志按钮
+                                    def create_download_handler(run_id):
+                                        def download_handler():
+                                            self._download_logs(run_id)
+                                        return download_handler
+                                    
+                                    download_button = ui.button(
+                                        '下载日志',
+                                        on_click=create_download_handler(report['run_id']),
+                                        color='secondary',
+                                        icon='download'
+                                    ).props('flat rounded')
                                 
                                 # 右侧：删除按钮
                                 with ui.row().classes('flex-grow-0'):
-                                    ui.button(
+                                    # 修复lambda函数变量绑定问题 - 添加超详细debug信息
+                                    def create_delete_handler(run_id, report_path):
+                                        logger.info(f"🔧 创建删除处理器 - run_id={run_id}, report_path={report_path}")
+                                        def delete_handler():
+                                            logger.info(f"🖱️ 删除按钮被点击！事件触发 - run_id={run_id}, report_path={report_path}")
+                                            logger.info(f"📋 点击详情 - 当前时间={datetime.now()}, 处理器ID={id(delete_handler)}")
+                                            logger.info(f"🚀 开始调用 _confirm_delete_report 函数")
+                                            try:
+                                                self._confirm_delete_report(run_id, report_path)
+                                                logger.info(f"✅ _confirm_delete_report 调用成功")
+                                            except Exception as e:
+                                                logger.error(f"❌ _confirm_delete_report 调用失败: {str(e)}", exc_info=True)
+                                        return delete_handler
+                                    
+                                    delete_button = ui.button(
                                         '删除',
-                                        on_click=lambda r=report['run_id'], p=report['report_path']: self._confirm_delete_report(r, p),
+                                        on_click=create_delete_handler(report['run_id'], report['report_path']),
                                         color='negative',
                                         icon='delete'
                                     ).props('flat rounded')
-    
-    def _create_delete_handler(self, run_id: str, report_path: str):
-        """创建删除处理器闭包"""
-        def delete_handler():
-            print(f"删除按钮被点击，Run ID: {run_id}")
-            self._confirm_delete_report(run_id, report_path)
-        return delete_handler
+                                    
+                                    logger.info(f"✅ 为报告 {report['run_id']} 创建了删除按钮 - 按钮ID={id(delete_button)}")
+                                    logger.info(f"📍 按钮已绑定到run_id={report['run_id']}, report_path={report['report_path']}")
+        
+        logger.info(f"✅ 报告渲染完成，总共 {len(reports)} 个报告")
     
     def _get_status_display(self, status: str) -> str:
         """获取状态的显示文本"""
@@ -315,74 +562,269 @@ class TestMonitor:
     
     def _confirm_delete_report(self, run_id: str, report_path: str):
         """确认删除报告"""
-        print(f"弹出删除确认对话框，Run ID: {run_id}, 报告路径: {report_path}")
-        with ui.dialog() as delete_dialog:
-            with ui.card().classes('p-4 max-w-md'):
-                ui.label('确认删除报告').classes('text-xl font-bold mb-4')
-                ui.label(f'确定要删除 Run ID 为 "{run_id}" 的测试报告吗？').classes('mb-4')
-                ui.label('此操作将删除：').classes('text-gray-600 mb-2')
-                ui.label('• 测试运行记录').classes('text-gray-500 ml-4 mb-1')
-                ui.label('• 相关的测试日志').classes('text-gray-500 ml-4 mb-1')
-                ui.label('• 报告文件（如果有）').classes('text-gray-500 ml-4 mb-4')
+        logger.info(f"🗺️ 触发确认删除对话框 - run_id={run_id}, report_path={report_path}")
+        logger.info(f"📅 对话框创建时间={datetime.now()}")
+        
+        try:
+            with ui.dialog() as delete_dialog:
+                logger.info(f"🔲 UI对话框对象创建成功 - 对话框ID={id(delete_dialog)}")
                 
-                with ui.row().classes('w-full justify-end mt-4'):
-                    ui.button('取消', on_click=delete_dialog.close).props('flat')
-                    ui.button(
-                        '删除',
-                        on_click=lambda: self._delete_report(run_id, report_path, delete_dialog),
-                        color='negative'
-                    )
+                with ui.card().classes('p-4 max-w-md'):
+                    logger.info(f"📦 对话框卡片创建成功")
+                    
+                    ui.label('确认删除报告').classes('text-xl font-bold mb-4')
+                    ui.label(f'确定要删除 Run ID 为 "{run_id}" 的测试报告吗？').classes('mb-4')
+                    ui.label('此操作将删除：').classes('text-gray-600 mb-2')
+                    ui.label('• 测试运行记录').classes('text-gray-500 ml-4 mb-1')
+                    ui.label('• 相关的测试日志').classes('text-gray-500 ml-4 mb-1')
+                    ui.label('• 报告文件（如果有）').classes('text-gray-500 ml-4 mb-4')
+                    
+                    with ui.row().classes('w-full justify-end mt-4'):
+                        logger.info(f"📝 创建取消按钮")
+                        ui.button('取消', on_click=delete_dialog.close).props('flat')
+                        logger.info(f"📝 创建确认删除按钮")
+                        
+                        # 修复lambda函数变量绑定问题 - 添加超详细debug信息
+                        def create_delete_confirmation_handler(run_id, report_path, delete_dialog):
+                            logger.info(f"🔧 创建确认删除处理器 - run_id={run_id}, report_path={report_path}, 对话框ID={id(delete_dialog)}")
+                            def delete_confirmation_handler():
+                                logger.info(f"🖱️ 确认删除按钮被点击！事件触发 - run_id={run_id}")
+                                logger.info(f"📋 确认删除详情 - 当前时间={datetime.now()}, 处理器ID={id(delete_confirmation_handler)}")
+                                logger.info(f"🚀 开始调用 _delete_report 函数")
+                                logger.info(f"📁 传递的参数 - run_id={run_id}, report_path={report_path}, delete_dialog={id(delete_dialog)}")
+                                try:
+                                    self._delete_report(run_id, report_path, delete_dialog)
+                                    logger.info(f"✅ _delete_report 调用成功")
+                                except Exception as e:
+                                    logger.error(f"❌ _delete_report 调用失败: {str(e)}", exc_info=True)
+                            return delete_confirmation_handler
+                        
+                        confirm_delete_button = ui.button(
+                            '删除',
+                            on_click=create_delete_confirmation_handler(run_id, report_path, delete_dialog),
+                            color='negative'
+                        )
+                        logger.info(f"✅ 确认删除按钮创建成功 - 按钮ID={id(confirm_delete_button)}")
+                        logger.info(f"📍 确认删除按钮已绑定到run_id={run_id}")
+                        
+                logger.info(f"🎯 对话框UI构建完成，准备显示")
+                logger.info(f"📢 调用 delete_dialog.open() 显示对话框")
+                delete_dialog.open()
+                logger.info(f"✅ 确认删除对话框创建并显示完成")
+                
+        except Exception as e:
+            logger.error(f"❌ 创建确认删除对话框失败: {str(e)}", exc_info=True)
+            ui.notify(f'创建删除对话框失败: {str(e)}', type='error')
     
     def _delete_report(self, run_id: str, report_path: str, delete_dialog):
         """删除报告"""
+        logger.info(f"🔥 开始执行删除报告 - run_id={run_id}, report_path={report_path}")
+        logger.info(f"📋 删除流程详情 - 当前时间={datetime.now()}, 对话框ID={id(delete_dialog)}")
+        logger.info(f"🔍 接收到的参数验证 - run_id类型={type(run_id)}, report_path类型={type(report_path)}, delete_dialog类型={type(delete_dialog)}")
+        
         try:
-            # 1. 删除报告文件（如果存在）
-            if report_path:
-                abs_path = os.path.abspath(report_path)
-                if os.path.exists(abs_path):
-                    os.remove(abs_path)
-                    print(f"已删除报告文件: {abs_path}")
+            deleted_files = []
+            logger.info(f"📝 初始化删除文件列表: {deleted_files}")
             
-            # 2. 从数据库中删除相关的测试运行记录和日志
-            storage_service.delete_test_run_and_logs(run_id)
-            print(f"已删除Run ID为 {run_id} 的数据库记录")
+            # 1. 从数据库中删除相关的测试运行记录和日志
+            logger.info(f"🗃️ 步骤1: 开始从数据库删除记录")
+            logger.info(f"🔍 查询数据库 - run_id={run_id}")
+            logger.info(f"📞 调用 storage_service.delete_test_run() 方法")
+            
+            success = storage_service.delete_test_run(run_id)
+            
+            logger.info(f"📊 数据库删除结果 - success={success}, run_id={run_id}")
+            
+            if not success:
+                logger.error(f"❌ 数据库删除失败 - run_id={run_id}")
+                logger.error(f"📋 失败详情 - 可能原因：网络问题、数据库锁定、记录不存在")
+                
+                # 关闭对话框
+                logger.info(f"🚪 关闭删除确认对话框")
+                delete_dialog.close()
+                logger.info(f"✅ 对话框已关闭")
+                
+                # 显示错误消息
+                logger.info(f"📢 显示错误通知消息")
+                ui.notify(f'删除数据库记录失败，请检查网络连接或联系管理员', type='error')
+                logger.info(f"✅ 错误通知已显示")
+                
+                # 刷新报告列表 - 即使失败也需要刷新以确保数据一致性
+                logger.info(f"🔄 刷新报告列表（失败后）")
+                ui.timer(0.1, self._load_reports, once=True)
+                logger.info(f"✅ 报告列表刷新定时器已启动（失败后）")
+                return
+            
+            logger.info(f"✅ 数据库删除成功 - run_id={run_id}")
+            
+            # 2. 删除报告文件（如果存在）- 智能路径处理
+            logger.info(f"📁 步骤2: 开始删除报告文件")
+            logger.info(f"🔍 检查报告路径 - report_path='{report_path}', 路径类型={type(report_path)}")
+            
+            if report_path:
+                logger.info(f"📋 报告路径有效，开始文件删除流程")
+                logger.info(f"🗂️ 尝试删除报告文件: {report_path}")
+                
+                # 尝试原始路径
+                abs_path = os.path.abspath(report_path)
+                logger.info(f"🔍 检查原始路径: {abs_path}")
+                logger.info(f"📂 原始路径存在性检查: {os.path.exists(abs_path)}")
+                if os.path.exists(abs_path):
+                    logger.info(f"✅ 原始路径文件存在，尝试删除")
+                    try:
+                        os.remove(abs_path)
+                        deleted_files.append(abs_path)
+                        logger.info(f"✅ 已删除报告文件（原始路径）: {abs_path}")
+                        logger.info(f"📝 已删除文件列表更新: {deleted_files}")
+                    except Exception as e:
+                        logger.error(f"❌ 删除原始路径文件失败: {str(e)}")
+                        logger.error(f"🔍 失败详情 - 异常类型={type(e).__name__}")
+                
+                # 如果原始路径不存在，尝试标准化路径
+                if not deleted_files:
+                    logger.info(f"🔄 原始路径未找到，尝试标准化路径")
+                    normalized_path = report_path.replace('\\', os.sep).replace('/', os.sep)
+                    normalized_abs_path = os.path.abspath(normalized_path)
+                    logger.info(f"🔍 检查标准化路径: {normalized_abs_path}")
+                    logger.info(f"📂 标准化路径存在性检查: {os.path.exists(normalized_abs_path)}")
+                    if os.path.exists(normalized_abs_path):
+                        logger.info(f"✅ 标准化路径文件存在，尝试删除")
+                        try:
+                            os.remove(normalized_abs_path)
+                            deleted_files.append(normalized_abs_path)
+                            logger.info(f"✅ 已删除报告文件（标准化路径）: {normalized_abs_path}")
+                            logger.info(f"📝 已删除文件列表更新: {deleted_files}")
+                        except Exception as e:
+                            logger.error(f"❌ 删除标准化路径文件失败: {str(e)}")
+                            logger.error(f"🔍 失败详情 - 异常类型={type(e).__name__}")
+                
+                # 如果仍然没有找到文件，尝试在标准报告目录中查找匹配的文件
+                if not deleted_files:
+                    logger.info(f"🔄 标准化路径也未找到，尝试标准报告目录")
+                    try:
+                        standard_report_path = os.path.join(settings.TEST_REPORTS_PATH, f"report_{run_id}.html")
+                        logger.info(f"🔍 检查标准路径: {standard_report_path}")
+                        logger.info(f"📂 标准路径存在性检查: {os.path.exists(standard_report_path)}")
+                        if os.path.exists(standard_report_path):
+                            logger.info(f"✅ 标准路径文件存在，尝试删除")
+                            try:
+                                os.remove(standard_report_path)
+                                deleted_files.append(standard_report_path)
+                                logger.info(f"✅ 已删除报告文件（标准路径）: {standard_report_path}")
+                                logger.info(f"📝 已删除文件列表更新: {deleted_files}")
+                            except Exception as e:
+                                logger.error(f"❌ 删除标准路径文件失败: {str(e)}")
+                                logger.error(f"🔍 失败详情 - 异常类型={type(e).__name__}")
+                        else:
+                            logger.info(f"ℹ️ 标准路径文件不存在，跳过")
+                    except Exception as e:
+                        logger.error(f"❌ 加载配置失败: {str(e)}")
+                        logger.error(f"🔍 配置加载失败详情 - 可能原因：配置文件不存在、格式错误")
+                
+                if not deleted_files:
+                    logger.warning(f"⚠️ 未找到报告文件，可能已被删除或路径错误: report_path={report_path}")
+                    logger.warning(f"🔍 路径分析 - 原始路径={report_path}, 绝对路径={abs_path}")
+                    logger.warning(f"ℹ️ 这可能是正常情况（文件已被删除或路径记录错误）")
+            else:
+                logger.info(f"ℹ️ 报告路径为空，跳过文件删除")
+            
+            # 3. 删除日志文件
+            logger.info(f"📁 步骤3: 开始删除日志文件")
+            log_file_path = os.path.join(settings.TEST_REPORTS_PATH, f"{run_id}.log")
+            logger.info(f"🔍 检查日志文件路径: {log_file_path}")
+            if os.path.exists(log_file_path):
+                try:
+                    os.remove(log_file_path)
+                    deleted_files.append(log_file_path)
+                    logger.info(f"✅ 已删除日志文件: {log_file_path}")
+                except Exception as e:
+                    logger.error(f"❌ 删除日志文件失败: {str(e)}")
+            else:
+                logger.info(f"ℹ️ 日志文件不存在，跳过: {log_file_path}")
+            
+            # 4. 构建成功消息并更新UI
+            logger.info(f"📊 步骤4: 构建成功消息和UI更新")
+            logger.info(f"📋 已删除测试运行记录: run_id={run_id}")
+            logger.info(f"📝 已删除文件列表: {deleted_files}")
+            
+            # 构建成功消息
+            if deleted_files:
+                file_list = '\n'.join([f"• {os.path.basename(f)}" for f in deleted_files])
+                message = f'Run ID "{run_id}" 的测试报告已删除\n已删除文件:\n{file_list}'
+                logger.info(f"📢 构建成功消息 - 包含文件列表: {len(deleted_files)} 个文件")
+            else:
+                message = f'Run ID "{run_id}" 的测试记录已删除（报告文件不存在或已删除）'
+                logger.info(f"📢 构建成功消息 - 无文件删除")
+            
+            logger.info(f"📋 最终成功消息: {message}")
             
             # 关闭对话框
+            logger.info(f"🚪 关闭删除确认对话框")
             delete_dialog.close()
+            logger.info(f"✅ 对话框已关闭")
             
             # 显示成功消息
-            ui.show_notification(f'Run ID "{run_id}" 的测试报告已删除', 3.0)
+            logger.info(f"📢 显示成功通知消息")
+            ui.notify(message, type='success', duration=5)
+            logger.info(f"✅ 成功通知已显示")
             
-            # 刷新报告列表
-            self._load_reports()
+            # 刷新报告列表 - 使用定时器确保UI更新
+            logger.info(f"🔄 刷新报告列表")
+            ui.timer(0.1, self._load_reports, once=True)
+            logger.info(f"✅ 报告列表刷新定时器已启动")
+            
+            logger.info(f"🎉 删除报告流程全部完成 - run_id={run_id}")
             
         except Exception as e:
             # 如果删除失败，显示错误消息
-            ui.show_notification(f'删除报告失败: {str(e)}', 5.0)
+            logger.error(f"💥 删除报告过程中发生异常: {str(e)}", exc_info=True)
+            logger.error(f"🔍 异常详情 - 异常类型={type(e).__name__}, run_id={run_id}")
+            logger.error(f"📋 异常堆栈跟踪已记录")
+            
+            try:
+                # 尝试关闭对话框
+                logger.info(f"🚪 尝试关闭对话框（异常处理）")
+                delete_dialog.close()
+                logger.info(f"✅ 对话框已关闭")
+            except Exception as dialog_e:
+                logger.error(f"❌ 关闭对话框失败: {str(dialog_e)}")
+            
+            # 显示错误消息
+            logger.info(f"📢 显示错误通知消息（异常处理）")
+            ui.notify(f'删除报告失败: {str(e)}，请检查文件权限或磁盘空间', type='error')
+            logger.info(f"✅ 错误通知已显示")
+            
+            logger.error(f"💔 删除报告流程异常结束 - run_id={run_id}")
+            logger.error(f"删除报告失败: {str(e)}", exc_info=True)
+            
             # 关闭对话框
             delete_dialog.close()
+            
+            # 显示错误消息
+            ui.notify(f'删除报告失败: {str(e)}，请检查文件权限或磁盘空间', type='error')
     
-    def _view_report(self, report_path: str):
+    def _view_report(self, report_path: str, run_id: str):
         """查看测试报告"""
         # 如果报告路径为空，显示提示
         if not report_path:
-            ui.show_notification('该测试运行没有生成报告文件', 5.0)
+            ui.notify('该测试运行没有生成报告文件', type='warning')
             return
         
         # 检查报告文件是否存在
         abs_path = os.path.abspath(report_path)
         if os.path.exists(abs_path):
             try:
-                # 使用webbrowser打开文件
-                webbrowser.open(f'file://{abs_path}')
+                # 使用新窗口打开报告页面
+                ui.run_javascript(f"window.open('/report/{run_id}', '_blank');")
                 # 显示成功提示
-                ui.show_notification('报告已在新窗口打开', 3.0)
+                ui.notify('报告已在新窗口打开', type='success')
             except Exception as e:
                 # 如果打开失败，显示错误提示
-                ui.show_notification(f'打开报告失败: {str(e)}', 5.0)
+                ui.notify(f'打开报告失败: {str(e)}', type='error')
         else:
             # 如果报告文件不存在，显示友好提示
-            ui.show_notification(
-                '报告文件不存在。可能的原因包括但不限制于：' + chr(10) + '• 测试可能未成功完成' + chr(10) + '• 报告文件可能在其他位置' + chr(10) + '• 报告文件可能被移动或删除', 
-                8.0
+            ui.notify(
+                '报告文件不存在，可能的原因:\n  • 测试可能未成功完成\n  • 报告文件可能在其他位置\n  • 报告文件可能被移动或删除', 
+                type='warning',
+                duration=8
             )

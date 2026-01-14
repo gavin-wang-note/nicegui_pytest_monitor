@@ -1,7 +1,7 @@
 from nicegui import ui, app
 from app.authentication import auth
 from app.dashboards import SystemMonitor, TestMonitor
-from app.services import monitor_service
+from app.services import monitor_service, storage_service
 from config.settings import settings
 import logging
 import os
@@ -39,22 +39,42 @@ class RemoteTestMonitorApp:
     
     def _create_log_panel(self):
         """创建日志面板"""
-        with ui.card().classes('w-full'):
-            ui.label('系统日志').classes('text-xl font-bold mb-4')
+        with ui.card().classes('w-full p-4'):
+            ui.label('系统日志').classes('text-xl font-bold mb-4 text-gray-700')
             
-            # 日志控制区
-            with ui.row().classes('w-full mb-4'):
-                # 自动刷新开关
-                self.auto_refresh = ui.switch('自动刷新', value=True).classes('mr-4')
-                
-                # 日志级别筛选
-                self.log_level = ui.select(['全部', 'DEBUG', 'INFO', 'WARNING', 'ERROR'], value='全部').classes('mr-4')
-                
-                # 刷新按钮
-                ui.button('刷新日志', on_click=self._refresh_logs).classes('mr-2')
-                
-                # 清空日志按钮
-                ui.button('清空显示', on_click=self._clear_logs)
+            # 日志控制区 - 现代化样式
+            with ui.card().classes('mb-4 bg-blue-50 border border-blue-100 rounded-lg'):
+                with ui.row().classes('items-center justify-between p-4 flex-wrap gap-4'):
+                    # 左侧：自动刷新开关
+                    with ui.row().classes('items-center'):
+                        self.auto_refresh = ui.switch('自动刷新', value=True)
+                    
+                    # 中间：日志级别筛选
+                    with ui.row().classes('items-center'):
+                        ui.label('级别:').classes('text-sm text-gray-600 mr-2')
+                        self.log_level = ui.select(
+                            ['全部', 'DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                            value='全部',
+                            on_change=self._refresh_logs
+                        ).classes('w-24')
+                    
+                    # 右侧：刷新间隔设置（根据自动刷新开关显示/隐藏）
+                    with ui.row().classes('items-center'):
+                        ui.label('刷新:').classes('text-sm text-gray-600 mr-2')
+                        with ui.row().classes('items-center') as self.refresh_slider_container:
+                            self.refresh_interval = ui.slider(
+                                min=1, max=30, value=2, step=1, 
+                                on_change=lambda e: self.interval_label.set_text(f'{e.value}秒')
+                            ).props('color=blue').classes('w-32')
+                            self.interval_label = ui.label('2秒').classes('text-sm text-blue-600 font-bold')
+                    
+                    # 监听自动刷新开关来控制滑块显示/隐藏
+                    self.auto_refresh.on_value_change(self._toggle_refresh_slider)
+                    
+                    # 按钮组
+                    with ui.row().classes('items-center'):
+                        ui.button('刷新日志', on_click=self._refresh_logs).props('color=primary').classes('mr-2')
+                        ui.button('清空显示', on_click=self._clear_logs).props('color=negative')
             
             # 日志显示区域
             self.log_output = ui.log().classes('w-full h-96')
@@ -69,24 +89,53 @@ class RemoteTestMonitorApp:
             
             # 设置自动刷新定时器
             if not hasattr(self, 'log_timer'):
-                self.log_timer = ui.timer(interval=2.0, callback=self._auto_refresh_logs)
+                self.log_timer = ui.timer(interval=self.refresh_interval.value, callback=self._auto_refresh_logs)
+    
+    def _toggle_refresh_slider(self, value):
+        """控制刷新滑块的显示/隐藏"""
+        visible = bool(value)
+        self.refresh_slider_container.visible = visible
     
     def _auto_refresh_logs(self):
         """自动刷新日志"""
         if self.auto_refresh.value:
             self._refresh_logs()
+            # 更新定时器间隔
+            self.log_timer.interval = self.refresh_interval.value
+    
+    def _find_latest_log_file(self):
+        """查找最近的日志文件"""
+        try:
+            if not os.path.exists(self.log_dir):
+                return None
+            
+            log_files = [f for f in os.listdir(self.log_dir) if f.startswith('app_') and f.endswith('.log')]
+            if not log_files:
+                return None
+            
+            # 按文件名排序，获取最新的日志文件
+            log_files.sort(reverse=True)
+            return os.path.join(self.log_dir, log_files[0])
+        except Exception as e:
+            self.logger.error(f"查找日志文件失败: {str(e)}")
+            return None
     
     def _refresh_logs(self):
         """刷新日志内容"""
         try:
             # 获取当前日志文件路径
-            log_file = os.path.join(self.log_dir, f"app_{datetime.now().strftime('%Y%m%d')}.log")
+            today = datetime.now().strftime('%Y%m%d')
+            log_file = os.path.join(self.log_dir, f"app_{today}.log")
             
-            # 检查文件是否存在
+            # 检查今天的日志文件是否存在，如果不存在则查找最近的日志文件
             if not os.path.exists(log_file):
-                self.log_output.push('日志文件不存在')
-                self.log_info.text = '日志文件不存在'
-                return
+                log_file = self._find_latest_log_file()
+                if not log_file:
+                    self.log_output.push('日志文件不存在')
+                    self.log_info.text = '日志文件不存在'
+                    return
+                else:
+                    self.log_info.text = f'显示历史日志: {os.path.basename(log_file)}'
             
             # 读取日志内容
             with open(log_file, 'r', encoding='utf-8') as f:
@@ -126,6 +175,36 @@ class RemoteTestMonitorApp:
         # 启动系统监控服务
         monitor_service.start_monitoring()
         
+        # 定义报告文件访问路由
+        @ui.page('/report/{run_id}')
+        def report_page(run_id: str):
+            """报告查看页面"""
+            # 获取测试运行信息
+            test_run = storage_service.get_test_run(run_id)
+            if not test_run or not test_run.report_path:
+                ui.label('报告不存在').classes('text-red-500 text-xl')
+                return
+            
+            # 检查报告文件是否存在
+            report_path = test_run.report_path
+            if not os.path.exists(report_path):
+                ui.label('报告文件不存在').classes('text-red-500 text-xl')
+                return
+            
+            # 设置页面标题
+            ui.page_title = f'测试报告 - {run_id}'
+            
+            # 读取报告文件内容
+            try:
+                with open(report_path, 'r', encoding='utf-8') as f:
+                    report_content = f.read()
+                
+                # 显示报告内容 (使用add_body_html处理包含script标签的HTML)
+                ui.add_body_html(report_content)
+                
+            except Exception as e:
+                ui.label(f'读取报告失败: {str(e)}').classes('text-red-500 text-xl')
+        
         # 定义页面路由
         @ui.page('/')
         def index_page():
@@ -141,11 +220,11 @@ class RemoteTestMonitorApp:
                 # 通知区域 - 使用模态对话框
                 self.notification_area = None
                 
-                # 创建通知模态区域
+                # 创建通知模态区域 - 修复黄色背景导致的文字清晰度问题
                 with ui.dialog() as self.notification_dialog:
-                    with ui.card().classes('p-4 bg-blue-50 border border-blue-200 rounded-lg'):
-                        self.notification_text = ui.label('')
-                        with ui.row().classes('w-full justify-end mt-2'):
+                    with ui.card().classes('p-6 bg-white border border-gray-300 rounded-lg shadow-lg'):
+                        self.notification_text = ui.label('').classes('text-gray-800 text-base leading-relaxed mb-4')
+                        with ui.row().classes('w-full justify-end mt-4'):
                             ui.button('确定', on_click=self._close_notification).props('flat color=primary')
                 
                 def show_notification(message, timeout=3.0):
