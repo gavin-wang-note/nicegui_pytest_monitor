@@ -1,9 +1,29 @@
 from typing import List, Dict, Any, Callable
 from datetime import datetime
+import logging
+import os
 from app.models import SystemData, TestRun
 from app.services.monitor_service import monitor_service
 from app.services.test_service import test_service
 from config.settings import settings
+
+def _setup_logger():
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d")}.log')
+    
+    logger = logging.getLogger('RemoteTestMonitor.AlertService')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = _setup_logger()
 
 class AlertService:
     def __init__(self):
@@ -81,13 +101,13 @@ class AlertService:
             try:
                 callback(alert)
             except Exception as e:
-                print(f"Alert callback error: {e}")
+                logger.error(f"Alert callback error: {e}")
     
     def _send_notification(self, alert: Dict[str, Any]):
         """发送告警通知"""
         # 这里可以扩展为邮件、Slack、企业微信等通知方式
         # 目前只打印到控制台
-        print(f"[ALERT] {alert['timestamp']} - {alert['message']}")
+        logger.warning(f"[ALERT] {alert['timestamp']} - {alert['message']}")
     
     def register_alert_callback(self, callback: Callable):
         """注册告警回调函数"""

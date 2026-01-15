@@ -12,8 +12,27 @@ from app.services.monitor_service import monitor_service
 from app.utils.process_utils import ProcessUtils
 from config.settings import settings
 
-# 获取日志记录器
-logger = logging.getLogger('RemoteTestMonitor.TestService')
+# 配置日志
+def _setup_logger():
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d")}.log')
+    
+    logger = logging.getLogger('RemoteTestMonitor.TestService')
+    logger.setLevel(logging.DEBUG)
+    
+    # 清除已有处理器
+    logger.handlers.clear()
+    
+    # 文件处理器
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = _setup_logger()
 
 class TestService:
     def __init__(self):
@@ -171,20 +190,29 @@ class TestService:
         if not line_stripped:
             return
         
+        is_passed = False
+        is_failed = False
+        
         pattern_passed = r'^[✅✔✓]\s*通过[:：]\s*.+'
         pattern_failed = r'^[❌✗×]\s*失败[:：]\s*.+'
         
-        is_passed = bool(re.match(pattern_passed, line_stripped))
-        is_failed = bool(re.match(pattern_failed, line_stripped))
+        if re.match(pattern_passed, line_stripped):
+            is_passed = True
+        elif re.match(pattern_failed, line_stripped):
+            is_failed = True
+        elif re.search(r'PASSED\s+', line_stripped):
+            is_passed = True
+        elif re.search(r'FAILED\s+', line_stripped):
+            is_failed = True
         
         if not is_passed and not is_failed:
             return
         
-        print(f"[Parse] 匹配到测试结果行: {line_stripped[:60]}...")
+        logger.debug(f"[Parse] 匹配到测试结果行: {line_stripped[:80]}...")
         
         test_run = storage_service.get_test_run(run_id)
         if not test_run:
-            print(f"[Parse] 错误：找不到测试记录 {run_id}")
+            logger.debug(f"[Parse] 错误：找不到测试记录 {run_id}")
             return
         
         old_passed = test_run.passed_tests
@@ -193,15 +221,15 @@ class TestService:
         
         if is_passed:
             test_run.passed_tests += 1
-            print(f"[Parse] 检测到通过用例")
+            logger.debug(f"[Parse] 检测到通过用例")
         elif is_failed:
             test_run.failed_tests += 1
-            print(f"[Parse] 检测到失败用例")
+            logger.debug(f"[Parse] 检测到失败用例")
         
         test_run.total_tests = test_run.passed_tests + test_run.failed_tests + test_run.skipped_tests
         storage_service.save_test_run(test_run)
         
-        print(f"[Parse] 统计更新: 通过 {old_passed}->{test_run.passed_tests}, 失败 {old_failed}->{test_run.failed_tests}, 跳过 {old_skipped}->{test_run.skipped_tests}")
+        logger.debug(f"[Parse] 统计更新: 通过 {old_passed}->{test_run.passed_tests}, 失败 {old_failed}->{test_run.failed_tests}, 跳过 {old_skipped}->{test_run.skipped_tests}")
         
         self._trigger_status_callbacks(test_run)
     
@@ -219,7 +247,7 @@ class TestService:
             return
         
         summary_text = summary_match.group(1)
-        print(f"[Summary] 解析汇总文本: {summary_text}")
+        logger.debug(f"[Summary] 解析汇总文本: {summary_text}")
         
         try:
             passed_tests_local = 0
@@ -232,22 +260,22 @@ class TestService:
             
             if passed_match:
                 passed_tests_local = int(passed_match.group(1))
-                print(f"[Summary] 解析到 passed: {passed_tests_local}")
+                logger.debug(f"[Summary] 解析到 passed: {passed_tests_local}")
             
             if failed_match:
                 failed_tests_local = int(failed_match.group(1))
-                print(f"[Summary] 解析到 failed: {failed_tests_local}")
+                logger.debug(f"[Summary] 解析到 failed: {failed_tests_local}")
             
             if skipped_match:
                 skipped_tests_local = int(skipped_match.group(1))
-                print(f"[Summary] 解析到 skipped: {skipped_tests_local}")
+                logger.debug(f"[Summary] 解析到 skipped: {skipped_tests_local}")
             
             if passed_tests_local > 0 or failed_tests_local > 0 or skipped_tests_local > 0:
                 total_tests_local = passed_tests_local + failed_tests_local + skipped_tests_local
-                print(f"[Summary] 汇总统计: 通过={passed_tests_local}, 失败={failed_tests_local}, 跳过={skipped_tests_local}, 总数={total_tests_local}")
+                logger.debug(f"[Summary] 汇总统计: 通过={passed_tests_local}, 失败={failed_tests_local}, 跳过={skipped_tests_local}, 总数={total_tests_local}")
                 self._update_test_statistics(run_id, total_tests_local, passed_tests_local, failed_tests_local, skipped_tests_local)
         except Exception as e:
-            print(f"[Summary] 解析统计失败: {e}")
+            logger.debug(f"[Summary] 解析统计失败: {e}")
     
     def _update_test_statistics(self, run_id: str, total_tests: int, passed_tests: int, failed_tests: int, skipped_tests: int):
         """更新测试统计数据"""
@@ -272,23 +300,68 @@ class TestService:
         """监控测试状态"""
         try:
             exit_code = process.wait()
-            print(f"[Monitor] 测试结束: run_id={run_id}, exit={exit_code}")
+            logger.debug(f"[Monitor] 测试结束: run_id={run_id}, exit={exit_code}")
             
             test_run = storage_service.get_test_run(run_id)
+            
             if test_run:
+                if test_run.passed_tests == 0 and test_run.failed_tests == 0:
+                    logger.debug(f"[Monitor] 警告: 统计仍为0，尝试解析日志文件获取最终统计...")
+                    self._parse_log_file_for_statistics(run_id)
+                    
+                    test_run = storage_service.get_test_run(run_id)
+                    logger.debug(f"[Monitor] 解析后: 通过={test_run.passed_tests}, 失败={test_run.failed_tests}, 跳过={test_run.skipped_tests}")
+                
                 total = test_run.passed_tests + test_run.failed_tests
                 success_rate = (test_run.passed_tests / total * 100) if total > 0 else 0
                 
-                if exit_code == 0 or (exit_code == 1 and success_rate >= 95):
-                    self._update_test_status(run_id, "completed", report_path, exit_code)
-                else:
-                    self._update_test_status(run_id, "failed", report_path, exit_code)
+                final_status = "completed" if (exit_code == 0 or (exit_code == 1 and success_rate >= 95)) else "failed"
+                
+                logger.debug(f"[Monitor] 测试完成: run_id={run_id}, 通过={test_run.passed_tests}, 失败={test_run.failed_tests}, 跳过={test_run.skipped_tests}, 成功率={success_rate:.1f}%, 状态={final_status}")
+                
+                self._update_test_status(run_id, final_status, report_path, exit_code)
         except Exception as e:
-            print(f"[Monitor] Error: {e}")
+            logger.debug(f"[Monitor] Error: {e}")
             try:
                 self._update_test_status(run_id, "failed", report_path)
             except:
                 pass
+    
+    def _parse_log_file_for_statistics(self, run_id: str):
+        """解析日志文件获取最终统计信息"""
+        log_file_path = os.path.join(settings.TEST_REPORTS_PATH, f"{run_id}.log")
+        
+        if not os.path.exists(log_file_path):
+            logger.debug(f"[ParseLog] 日志文件不存在: {log_file_path}")
+            return
+        
+        logger.debug(f"[ParseLog] 开始解析日志文件: {log_file_path}")
+        
+        passed = 0
+        failed = 0
+        skipped = 0
+        summary_parsed = False
+        
+        try:
+            with open(log_file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    self._parse_test_result_line(line, run_id)
+                    
+                    if '=' in line and not summary_parsed:
+                        self._parse_test_statistics(line, run_id)
+                        summary_parsed = True
+            
+            logger.debug(f"[ParseLog] 日志解析完成")
+            
+            test_run = storage_service.get_test_run(run_id)
+            if test_run:
+                logger.debug(f"[ParseLog] 最终统计: 通过={test_run.passed_tests}, 失败={test_run.failed_tests}, 跳过={test_run.skipped_tests}")
+        except Exception as e:
+            logger.debug(f"[ParseLog] 解析日志文件失败: {e}")
     
     def _cleanup_stuck_tests(self):
         """清理卡在running状态的测试记录"""
@@ -314,7 +387,7 @@ class TestService:
         """更新测试状态"""
         existing_test_run = storage_service.get_test_run(run_id)
         if existing_test_run:
-            print(f"[Status] 更新状态: run_id={run_id}, {existing_test_run.status} -> {status}")
+            logger.debug(f"[Status] 更新状态: run_id={run_id}, {existing_test_run.status} -> {status}")
             existing_test_run.status = status
             existing_test_run.end_time = datetime.now()
             if report_path:
@@ -325,7 +398,7 @@ class TestService:
             
             self._trigger_status_callbacks(existing_test_run)
         else:
-            print(f"[Status] 错误：找不到测试运行记录: run_id={run_id}")
+            logger.warning(f"[Status] 错误：找不到测试运行记录: run_id={run_id}")
     
     def add_to_queue(self, test_path: str, priority: int = 0) -> str:
         """添加测试到队列"""
@@ -406,7 +479,7 @@ class TestService:
             try:
                 callback(test_log)
             except Exception as e:
-                print(f"Log callback error: {e}")
+                logger.error(f"Log callback error: {e}")
     
     def _trigger_status_callbacks(self, test_run: TestRun):
         """触发状态回调"""
@@ -414,7 +487,7 @@ class TestService:
             try:
                 callback(test_run)
             except Exception as e:
-                print(f"Status callback error: {e}")
+                logger.error(f"Status callback error: {e}")
     
     def get_test_reports(self) -> List[Dict[str, Any]]:
         """获取测试报告列表"""

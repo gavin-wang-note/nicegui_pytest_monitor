@@ -1,25 +1,39 @@
 import asyncio
 import os
 import logging
+from datetime import datetime
 
 from nicegui import ui, app
 from typing import List, Dict, Any
-from datetime import datetime
 from app.models import TestLog, TestRun
 from app.services import test_service, storage_service
 from config.settings import settings
 
-# 获取日志记录器
-logger = logging.getLogger('RemoteTestMonitor.TestMonitor')
+def _setup_logger():
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d")}.log')
+    
+    logger = logging.getLogger('RemoteTestMonitor.TestMonitor')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = _setup_logger()
 
 
 class TestMonitor:
     def __init__(self):
         self.current_run_id = None
         self.test_logs = []
-        self.max_log_lines = 500   # 最大日志行数
-        self.refresh_timer = None  # 自动刷新定时器
-        self.refresh_interval = 2  # 刷新间隔（秒）
+        self.max_log_lines = 500
+        self._pending_status_update = None
     
     def create_dashboard(self):
         """创建测试监控仪表板"""
@@ -58,9 +72,7 @@ class TestMonitor:
             with ui.card().classes('w-full mt-4'):
                 with ui.row().classes('w-full justify-between items-center mb-2'):
                     ui.label('测试报告').classes('text-lg font-semibold')
-                    with ui.row().classes('items-center'):
-                        self.auto_refresh_status = ui.badge('自动刷新: 关闭', color='gray').classes('mr-2')
-                        self.refresh_button = ui.button('刷新', on_click=self._load_reports, icon='refresh').props('flat')
+                    ui.button('刷新', on_click=self._load_reports, icon='refresh').props('flat')
                 
                 self.report_list = ui.list().classes('w-full')
                 self._load_reports()
@@ -68,53 +80,8 @@ class TestMonitor:
         # 注册测试日志回调
         test_service.register_log_callback(self._update_log)
         test_service.register_status_callback(self._update_test_status)
-    
-    def _start_auto_refresh(self):
-        """开始自动刷新"""
-        if self.refresh_timer is None:
-            self.refresh_timer = ui.timer(self.refresh_interval, self._auto_refresh, active=True)
-            # 更新自动刷新状态显示
-            self.auto_refresh_status.text = f'自动刷新: 开启 ({self.refresh_interval}s)'
-            self.auto_refresh_status.props('color=green')
-            logger.debug(f"自动刷新已启动，间隔: {self.refresh_interval}秒")
-    
-    def _stop_auto_refresh(self):
-        """停止自动刷新"""
-        if self.refresh_timer:
-            self.refresh_timer.deactivate()
-            self.refresh_timer = None
-            # 更新自动刷新状态显示
-            self.auto_refresh_status.text = '自动刷新: 关闭'
-            self.auto_refresh_status.props('color=gray')
-            logger.debug("自动刷新已停止")
-    
-    def _auto_refresh(self):
-        """自动刷新逻辑 - 检查是否有正在运行的测试"""
-        running_tests = storage_service.get_running_tests()
-        logger.debug(f"自动刷新检查 - 运行中测试数量: {len(running_tests)}")
         
-        if running_tests:
-            logger.debug(f"检测到 {len(running_tests)} 个运行中的测试，自动刷新...")
-            # 强制刷新UI和数据
-            self._force_refresh_reports()
-        else:
-            logger.debug("没有检测到运行中的测试，先刷新报告列表更新状态...")
-            self._load_reports()
-            self._stop_auto_refresh()
-    
-    def _force_refresh_reports(self):
-        """强制刷新报告列表和统计数据"""
-        logger.debug("执行强制刷新...")
-        
-        # 获取所有测试运行
-        all_tests = storage_service.get_all_test_runs()
-        logger.debug(f"数据库中总共有 {len(all_tests)} 个测试运行")
-        
-        for test in all_tests:
-            logger.debug(f"  - 测试运行: run_id={test.run_id}, status={test.status}, 总数={test.total_tests}, 通过={test.passed_tests}, 失败={test.failed_tests}, 跳过={test.skipped_tests}")
-        
-        # 刷新UI显示
-        self._load_reports()
+        ui.timer(0.5, self._check_and_process_status)
     
     def _start_test(self):
         """开始执行测试"""
@@ -146,11 +113,8 @@ class TestMonitor:
         try:
             # 开始测试
             self.current_run_id = test_service.start_test(test_path)
-            print(f"[DEBUG] 测试已启动: run_id={self.current_run_id}")
-            print(f"[DEBUG] self.test_status 对象存在: {self.test_status is not None}")
-            
-            # 启动自动刷新
-            self._start_auto_refresh()
+            logger.debug(f"[DEBUG] 测试已启动: run_id={self.current_run_id}")
+            logger.debug(f"[DEBUG] self.test_status 对象存在: {self.test_status is not None}")
             
             # 立即刷新报告列表以显示新测试
             self._load_reports()
@@ -158,26 +122,23 @@ class TestMonitor:
             # 更新UI状态
             self.start_button.disable()
             self.stop_button.enable()
-            print(f"[DEBUG] 更新UI状态: test_status.text = '测试正在执行...'")
+            logger.debug(f"[DEBUG] 更新UI状态: test_status.text = '测试正在执行...'")
             self.test_status.text = f'测试正在执行... (Run ID: {self.current_run_id})'
-            print(f"[DEBUG] 更新后的text值: {self.test_status.text}")
+            logger.debug(f"[DEBUG] 更新后的text值: {self.test_status.text}")
             self.test_status.classes(remove='text-red-500 text-green-500').classes('text-blue-500')
-            print(f"[DEBUG] UI状态更新完成")
+            logger.debug(f"[DEBUG] UI状态更新完成")
             
             ui.notify(f'测试已开始: {test_path}', type='success')
         except Exception as e:
-            print(f"[DEBUG] 测试启动异常: {e}")
+            logger.error(f"[DEBUG] 测试启动异常: {e}")
             import traceback
-            traceback.print_exc()
+            logger.error(f"启动异常堆栈: {traceback.format_exc()}")
             ui.notify(f'测试启动失败: {str(e)}', type='error')
     
     def _stop_test(self):
         """停止正在执行的测试"""
         if self.current_run_id:
             if test_service.stop_test(self.current_run_id):
-                # 停止自动刷新
-                self._stop_auto_refresh()
-                
                 # 更新UI状态
                 self.start_button.enable()
                 self.stop_button.disable()
@@ -190,28 +151,28 @@ class TestMonitor:
     
     def _update_log(self, test_log: TestLog):
         """更新测试日志"""
-        print(f"[DEBUG] _update_log 被调用: run_id={test_log.run_id}, current_run_id={self.current_run_id}")
+        logger.debug(f"[DEBUG] _update_log 被调用: run_id={test_log.run_id}, current_run_id={self.current_run_id}")
         
         if not self.current_run_id:
-            print(f"[DEBUG] current_run_id 为 None，自动设置为当前日志的 run_id")
+            logger.debug(f"[DEBUG] current_run_id 为 None，自动设置为当前日志的 run_id")
             self.current_run_id = test_log.run_id
         
         if test_log.run_id != self.current_run_id:
-            print(f"[DEBUG] 日志被跳过: run_id不匹配 ({test_log.run_id} != {self.current_run_id})")
+            logger.debug(f"[DEBUG] 日志被跳过: run_id不匹配 ({test_log.run_id} != {self.current_run_id})")
             return
         
         self.test_logs.append(test_log)
         
         log_message = f"[{test_log.timestamp.strftime('%H:%M:%S')}] {test_log.message}"
-        print(f"[DEBUG] 推送日志到UI: {log_message[:50]}...")
+        logger.debug(f"[DEBUG] 推送日志到UI: {log_message[:50]}...")
         
         async def update_ui():
-            print(f"[DEBUG] 执行UI更新: {log_message[:50]}...")
+            logger.debug(f"[DEBUG] 执行UI更新: {log_message[:50]}...")
             try:
                 self.log_output.push(log_message)
-                print(f"[DEBUG] UI日志更新成功，当前日志数量: {len(self.test_logs)}")
+                logger.debug(f"[DEBUG] UI日志更新成功，当前日志数量: {len(self.test_logs)}")
             except Exception as e:
-                print(f"日志输出失败: {e}")
+                logger.error(f"日志输出失败: {e}")
             
             if len(self.test_logs) > self.max_log_lines:
                 try:
@@ -220,7 +181,7 @@ class TestMonitor:
                         log_msg = f"[{log.timestamp.strftime('%H:%M:%S')}] {log.message}"
                         self.log_output.push(log_msg)
                 except Exception as e:
-                    print(f"清除日志失败: {e}")
+                    logger.error(f"清除日志失败: {e}")
         
         try:
             loop = asyncio.get_running_loop()
@@ -229,64 +190,58 @@ class TestMonitor:
             future = asyncio.run_coroutine_threadsafe(update_ui(), loop)
             result = future.result(timeout=5)
         except Exception as e:
-            print(f"UI更新失败: {e}")
+            logger.error(f"UI更新失败: {e}")
             asyncio.run(update_ui())
     
     def _update_test_status(self, test_run: TestRun):
         """更新测试状态"""
-        print(f"[STATUS-CB] _update_test_status 被调用: test_run.run_id={test_run.run_id}, self.current_run_id={self.current_run_id}, status={test_run.status}")
+        logger.debug(f"[STATUS-CB] _update_test_status 被调用: test_run.run_id={test_run.run_id}, self.current_run_id={self.current_run_id}, status={test_run.status}")
         
-        # 如果当前没有正在运行的测试，忽略状态回调（避免旧测试的状态干扰）
-        # 但是如果测试状态为 running，说明是新的测试开始了，设置 current_run_id
         if not self.current_run_id:
             if test_run.status == 'running':
-                print(f"[STATUS-CB] current_run_id 为 None 但测试已开始，自动设置为当前测试 run_id")
+                logger.debug(f"[STATUS-CB] current_run_id 为 None 但测试已开始，自动设置为当前测试 run_id")
                 self.current_run_id = test_run.run_id
             else:
-                print(f"[STATUS-CB] current_run_id 为 None 且测试未运行，忽略状态回调")
+                logger.debug(f"[STATUS-CB] current_run_id 为 None 且测试未运行，忽略状态回调")
                 return
         
         if test_run.run_id != self.current_run_id:
-            print(f"[DEBUG] run_id 不匹配，忽略状态回调")
+            logger.debug(f"[DEBUG] run_id 不匹配，忽略状态回调")
             return
         
-        async def update_ui():
-            print(f"[DEBUG] update_ui 执行 - test_run.status={test_run.status}")
-            
-            # 根据状态更新UI
-            if test_run.status == 'completed':
-                self.test_status.text = f'测试已完成 (Run ID: {test_run.run_id})'
-                self.test_status.classes(remove='text-blue-500 text-red-500').classes('text-green-500')
-                ui.notify('测试已完成', type='success')
-            elif test_run.status == 'failed':
-                self.test_status.text = f'测试失败 (Run ID: {test_run.run_id})'
-                self.test_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
-                ui.notify('测试失败', type='error')
-            elif test_run.status == 'stopped':
-                self.test_status.text = f'测试已停止 (Run ID: {test_run.run_id})'
-                self.test_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
-            
-            # 停止自动刷新
-            self._stop_auto_refresh()
-            
-            # 恢复按钮状态
-            self.start_button.enable()
-            self.stop_button.disable()
-            
-            # 清除当前运行ID
-            print(f"[DEBUG] 清除 current_run_id: {self.current_run_id}")
-            self.current_run_id = None
-            
-            # 刷新报告列表
-            print(f"[DEBUG] 调用 _load_reports() 刷新UI")
-            self._load_reports()
-            print(f"[DEBUG] _load_reports() 执行完成")
+        self._pending_status_update = test_run
+    
+    def _check_and_process_status(self):
+        """检查并处理挂起的状态更新"""
+        if self._pending_status_update is None:
+            return
         
-        try:
-            loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(update_ui()))
-        except RuntimeError:
-            asyncio.run(update_ui())
+        test_run = self._pending_status_update
+        self._pending_status_update = None
+        
+        logger.debug(f"[DEBUG] _check_and_process_status 执行 - test_run.status={test_run.status}")
+        
+        if test_run.status == 'completed':
+            self.test_status.text = f'测试已完成 (Run ID: {test_run.run_id})'
+            self.test_status.classes(remove='text-blue-500 text-red-500').classes('text-green-500')
+            ui.notify('测试已完成', type='success')
+        elif test_run.status == 'failed':
+            self.test_status.text = f'测试失败 (Run ID: {test_run.run_id})'
+            self.test_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
+            ui.notify('测试失败', type='error')
+        elif test_run.status == 'stopped':
+            self.test_status.text = f'测试已停止 (Run ID: {test_run.run_id})'
+            self.test_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
+        
+        self.start_button.enable()
+        self.stop_button.disable()
+        
+        logger.debug(f"[DEBUG] 清除 current_run_id: {self.current_run_id}")
+        self.current_run_id = None
+        
+        logger.debug(f"[DEBUG] 调用 _load_reports() 刷新UI")
+        self._load_reports()
+        logger.debug(f"[DEBUG] _load_reports() 执行完成")
     
     def _download_logs(self, run_id: str = None):
         """下载测试日志"""

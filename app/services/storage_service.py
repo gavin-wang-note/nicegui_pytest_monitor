@@ -6,8 +6,23 @@ from typing import List, Optional, Dict, Any
 from app.models import SystemData, TestResult, TestRun, TestQueueItem, TestLog
 from config.settings import settings
 
-# 获取日志记录器
-logger = logging.getLogger('RemoteTestMonitor.StorageService')
+def _setup_logger():
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d")}.log')
+    
+    logger = logging.getLogger('RemoteTestMonitor.StorageService')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = _setup_logger()
 
 class StorageService:
     def __init__(self):
@@ -193,7 +208,7 @@ class StorageService:
                 if has_progress or (current_time - test_run.start_time).total_seconds() < 600:  # 10分钟内开始的
                     active_tests.append(test_run)
             
-            print(f"筛选后的活跃测试数量: {len(active_tests)}")
+            logger.debug(f"筛选后的活跃测试数量: {len(active_tests)}")
             return active_tests
     
     def save_test_run(self, test_run: TestRun):
