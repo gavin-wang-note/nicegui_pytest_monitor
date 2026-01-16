@@ -192,20 +192,26 @@ class TestService:
         
         is_passed = False
         is_failed = False
+        is_skipped = False
         
         pattern_passed = r'^[✅✔✓]\s*通过[:：]\s*.+'
         pattern_failed = r'^[❌✗×]\s*失败[:：]\s*.+'
+        pattern_skipped = r'^[⏭️]\s*跳过[:：]\s*.+'
         
         if re.match(pattern_passed, line_stripped):
             is_passed = True
         elif re.match(pattern_failed, line_stripped):
             is_failed = True
+        elif re.match(pattern_skipped, line_stripped):
+            is_skipped = True
         elif re.search(r'PASSED\s+', line_stripped):
             is_passed = True
         elif re.search(r'FAILED\s+', line_stripped):
             is_failed = True
+        elif re.search(r'SKIPPED\s+', line_stripped):
+            is_skipped = True
         
-        if not is_passed and not is_failed:
+        if not is_passed and not is_failed and not is_skipped:
             return
         
         logger.debug(f"[Parse] 匹配到测试结果行: {line_stripped[:80]}...")
@@ -225,6 +231,9 @@ class TestService:
         elif is_failed:
             test_run.failed_tests += 1
             logger.debug(f"[Parse] 检测到失败用例")
+        elif is_skipped:
+            test_run.skipped_tests += 1
+            logger.debug(f"[Parse] 检测到跳过用例")
         
         test_run.total_tests = test_run.passed_tests + test_run.failed_tests + test_run.skipped_tests
         storage_service.save_test_run(test_run)
