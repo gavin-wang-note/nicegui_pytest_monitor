@@ -246,10 +246,14 @@ class RemoteTestMonitorApp:
                     ui.button(on_click=lambda: self._show_welcome_message(), icon='info')
                 
                 # 主内容区域
+                with ui.row().classes('w-full items-center mb-2'):
+                    ui.label('📊').classes('text-2xl')
+                    ui.label('远程测试监控系统').classes('text-xl font-bold text-gray-800')
+                
                 with ui.tabs().classes('w-full') as tabs:
-                    system_tab = ui.tab('系统监控')
-                    test_tab = ui.tab('测试监控')
-                    log_tab = ui.tab('日志')
+                    system_tab = ui.tab('🖥️ 系统监控').classes('text-base font-medium')
+                    test_tab = ui.tab('🧪 测试监控').classes('text-base font-medium')
+                    log_tab = ui.tab('📋 日志').classes('text-base font-medium')
                 
                 with ui.tab_panels(tabs, value=system_tab).classes('w-full'):
                     # 系统监控面板
