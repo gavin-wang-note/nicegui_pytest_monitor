@@ -7,35 +7,43 @@ import logging
 import os
 import time
 from datetime import datetime
+from typing import Dict, Any
 
 class RemoteTestMonitorApp:
     def __init__(self):
         self.system_monitor = SystemMonitor()
         self.test_monitor = TestMonitor()
-        # 创建日志目录
         self.log_dir = settings.LOG_PATH
         os.makedirs(self.log_dir, exist_ok=True)
         
-        # 配置日志
         self._setup_logging()
+        self._setup_exception_handler()
     
     def _setup_logging(self):
         """设置日志记录"""
-        # 创建日志文件路径
         log_file = os.path.join(self.log_dir, f"app_{datetime.now().strftime('%Y%m%d')}.log")
         
-        # 配置日志记录器
         logging.basicConfig(
             level=logging.DEBUG,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            format=settings.LOG_FORMAT,
+            datefmt=settings.LOG_DATE_FORMAT,
             handlers=[
-                logging.FileHandler(log_file, encoding='utf-8')
+                logging.FileHandler(log_file, encoding='utf-8'),
             ]
         )
         
-        # 获取应用日志记录器
         self.logger = logging.getLogger('RemoteTestMonitor')
         self.logger.info("应用日志系统已启动")
+    
+    def _setup_exception_handler(self):
+        """设置全局异常处理，防止NiceGUI并发问题导致应用崩溃"""
+        def handle_exception(e: Exception):
+            try:
+                self.logger.error(f"捕获到异常: {type(e).__name__}: {str(e)}")
+            except Exception:
+                pass
+        
+        app.on_exception(handle_exception)
     
     def _create_log_panel(self):
         """创建日志面板"""
@@ -64,7 +72,7 @@ class RemoteTestMonitorApp:
                         with ui.row().classes('items-center') as self.refresh_slider_container:
                             self.refresh_interval = ui.slider(
                                 min=1, max=30, value=2, step=1, 
-                                on_change=lambda e: self.interval_label.set_text(f'{e.value}秒')
+                                on_change=self._on_interval_change
                             ).props('color=blue').classes('w-32')
                             self.interval_label = ui.label('2秒').classes('text-sm text-blue-600 font-bold')
                     
@@ -91,6 +99,12 @@ class RemoteTestMonitorApp:
             if not hasattr(self, 'log_timer'):
                 self.log_timer = ui.timer(interval=self.refresh_interval.value, callback=self._auto_refresh_logs)
     
+    def _on_interval_change(self, e):
+        """刷新间隔变化时的处理"""
+        self.interval_label.text = f'{e.value}秒'
+        if hasattr(self, 'log_timer') and self.log_timer:
+            self.log_timer.interval = e.value
+
     def _toggle_refresh_slider(self, value):
         """控制刷新滑块的显示/隐藏"""
         visible = bool(value)
@@ -100,8 +114,6 @@ class RemoteTestMonitorApp:
         """自动刷新日志"""
         if self.auto_refresh.value:
             self._refresh_logs()
-            # 更新定时器间隔
-            self.log_timer.interval = self.refresh_interval.value
     
     def _find_latest_log_file(self):
         """查找最近的日志文件"""

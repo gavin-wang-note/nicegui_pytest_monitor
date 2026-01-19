@@ -1,5 +1,6 @@
 import asyncio
 import os
+import uuid
 import logging
 from datetime import datetime
 
@@ -10,19 +11,8 @@ from app.services import test_service, storage_service
 from config.settings import settings
 
 def _setup_logger():
-    log_dir = settings.LOG_PATH
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d")}.log')
-    
     logger = logging.getLogger('RemoteTestMonitor.TestMonitor')
     logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
-    
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(file_handler)
-    
     return logger
 
 logger = _setup_logger()
@@ -34,6 +24,7 @@ class TestMonitor:
         self.test_logs = []
         self.max_log_lines = 500
         self._pending_status_update = None
+        self._rendered_report_ids = set()
     
     def create_dashboard(self):
         """创建测试监控仪表板"""
@@ -74,7 +65,8 @@ class TestMonitor:
                     ui.label('测试报告').classes('text-lg font-semibold')
                     ui.button('刷新', on_click=self._load_reports, icon='refresh').props('flat')
                 
-                self.report_list = ui.list().classes('w-full')
+                self.report_container = ui.column().classes('w-full')
+                self.report_cards = {}
                 self._load_reports()
         
         # 注册测试日志回调
@@ -219,7 +211,7 @@ class TestMonitor:
         test_run = self._pending_status_update
         self._pending_status_update = None
         
-        logger.debug(f"[DEBUG] _check_and_process_status 执行 - test_run.status={test_run.status}")
+        logger.info(f"[STATUS] 处理状态更新: run_id={test_run.run_id}, status={test_run.status}")
         
         if test_run.status == 'completed':
             self.test_status.text = f'测试已完成 (Run ID: {test_run.run_id})'
@@ -236,18 +228,69 @@ class TestMonitor:
         self.start_button.enable()
         self.stop_button.disable()
         
-        logger.debug(f"[DEBUG] 清除 current_run_id: {self.current_run_id}")
+        logger.info(f"[STATUS] 清除 current_run_id: {self.current_run_id}")
         self.current_run_id = None
         
-        logger.debug(f"[DEBUG] 调用 _load_reports() 刷新UI")
+        logger.info(f"[STATUS] 调用 _load_reports() 刷新UI")
         self._load_reports()
-        logger.debug(f"[DEBUG] _load_reports() 执行完成")
+        logger.info(f"[STATUS] _load_reports() 执行完成")
     
     def _download_logs(self, run_id: str = None):
         """下载测试日志"""
         target_run_id = run_id or self.current_run_id
+        
+        if run_id:
+            log_file_path = os.path.join(settings.TEST_REPORTS_PATH, f"{run_id}.log")
+            
+            if not os.path.exists(log_file_path):
+                ui.notify(f'日志文件不存在: {log_file_path}', type='warning', duration=5)
+                return
+            
+            if os.path.getsize(log_file_path) == 0:
+                ui.notify(f'日志文件为空', type='info', duration=5)
+                return
+            
+            try:
+                ui.download(
+                    src=log_file_path,
+                    filename=f'test_logs_{run_id}.txt',
+                    media_type='text/plain'
+                )
+                logger.info(f"日志下载成功: {run_id}")
+                return
+            except Exception as e:
+                ui.notify(f'下载日志失败: {str(e)}', type='error')
+                return
+        
+        if self.test_logs:
+            try:
+                log_content = '\n'.join([
+                    f"[{log.timestamp.strftime('%Y-%m-%d %H:%M:%S')}] {log.message}"
+                    for log in self.test_logs
+                ])
+                if target_run_id:
+                    filename = f'test_logs_{target_run_id}.txt'
+                else:
+                    filename = f'test_logs_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
+                
+                temp_file = os.path.join(settings.TEMP_PATH, f"download_{uuid.uuid4().hex}.txt")
+                os.makedirs(settings.TEMP_PATH, exist_ok=True)
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    f.write(log_content)
+                
+                ui.download(
+                    src=temp_file,
+                    filename=filename,
+                    media_type='text/plain'
+                )
+                logger.info(f"日志下载成功，共 {len(self.test_logs)} 条记录")
+                return
+            except Exception as e:
+                ui.notify(f'下载日志失败: {str(e)}', type='error')
+                return
+        
         if not target_run_id:
-            ui.notify('请先选择一个测试记录', type='warning')
+            ui.notify('请先执行测试以生成日志', type='warning')
             return
         
         log_file_path = os.path.join(settings.TEST_REPORTS_PATH, f"{target_run_id}.log")
@@ -283,18 +326,13 @@ class TestMonitor:
         # 格式化数据为前端需要的格式
         reports = []
         for run in test_runs:
-            # 计算运行时间（如果存在结束时间）
             duration = None
             if run.end_time:
                 duration = (run.end_time - run.start_time).total_seconds()
             
-            # 格式化状态显示
             status_display = self._get_status_display(run.status)
-            
-            # 格式化开始时间
             start_time_str = run.start_time.strftime('%Y-%m-%d %H:%M:%S')
             
-            # 添加到报告列表
             reports.append({
                 'run_id': run.run_id,
                 'test_path': run.test_path,
@@ -306,180 +344,276 @@ class TestMonitor:
                 'passed_tests': run.passed_tests,
                 'failed_tests': run.failed_tests,
                 'skipped_tests': run.skipped_tests,
-                'report_path': run.report_path
+                'report_path': run.report_path,
+                'start_datetime': run.start_time  # 用于排序
             })
         
-        # 清空现有报告列表并重新渲染
-        logger.info("清空报告列表并重新渲染")
-        self.report_list.clear()
+        # 按状态和时间排序：运行中的排在最前面，其他按开始时间倒序
+        reports.sort(key=lambda x: (x['status'] != 'running', -x['start_datetime'].timestamp()))
         
-        # 立即渲染报告
-        self._render_reports(reports)
+        current_report_ids = {r['run_id'] for r in reports}
+        new_report_ids = current_report_ids - set(self.report_cards.keys())
+        removed_report_ids = set(self.report_cards.keys()) - current_report_ids
+        
+        if not reports:
+            logger.info("没有报告数据，清空所有报告")
+            for run_id in list(self.report_cards.keys()):
+                self.report_cards[run_id]['card'].delete()
+                del self.report_cards[run_id]
+        elif new_report_ids:
+            logger.info(f"发现 {len(new_report_ids)} 个新报告需要渲染")
+            for run_id in list(self.report_cards.keys()):
+                self.report_cards[run_id]['card'].delete()
+                del self.report_cards[run_id]
+            self._render_reports(reports)
+        elif removed_report_ids:
+            logger.info(f"发现 {len(removed_report_ids)} 个报告已被移除")
+            for run_id in removed_report_ids:
+                if run_id in self.report_cards:
+                    self.report_cards[run_id]['card'].delete()
+                    del self.report_cards[run_id]
+        else:
+            logger.debug(f"执行 _update_changed_reports，报告数量: {len(reports)}")
+            updated_count = self._update_changed_reports(reports)
+            logger.debug(f"_update_changed_reports 返回更新数量: {updated_count}")
+            if updated_count > 0:
+                logger.info(f"有 {updated_count} 个报告数据已更新，更新了统计信息")
+            else:
+                logger.info("没有新报告，数据无变化，跳过渲染")
+        
+        logger.info(f"当前已渲染报告数: {len(self.report_cards)}")
     
     def _render_reports(self, reports):
-        """渲染报告列表到UI"""
+        """渲染报告列表到UI（按排序顺序：运行中在前，时间倒序）"""
         logger.info(f"开始渲染 {len(reports)} 个报告")
         
-        with self.report_list:
-            # 如果没有报告数据，显示空状态
-            if not reports:
-                with ui.card().classes('w-full bg-gray-50'):
-                    with ui.column().classes('w-full items-center p-4'):
-                        ui.icon('article', size='48px', color='gray')
-                        ui.label('暂无测试报告').classes('text-lg mt-2 text-gray-600')
-                        ui.label('执行测试后将在这里显示报告').classes('text-sm text-gray-400')
+        for report in reports:
+            run_id = report['run_id']
+            logger.info(f"渲染报告: {run_id}")
+            
+            total = report['total_tests']
+            passed = report['passed_tests']
+            failed = report['failed_tests']
+            skipped = report['skipped_tests']
+            success_rate = (passed / (total - skipped) * 100) if (total - skipped) > 0 else 100
+            
+            db_status = report['status']
+            
+            if db_status == 'running':
+                effective_status = 'running'
+            elif db_status == 'completed':
+                if success_rate < 95:
+                    effective_status = 'failed'
+                else:
+                    effective_status = 'completed'
             else:
-                # 添加报告到列表，使用现代化样式
-                for report in reports:
-                    logger.info(f"渲染报告: {report['run_id']}")
-                    with ui.card().classes('w-full mb-4 border rounded-lg shadow-sm hover:shadow-md transition-all duration-200'):
-                        with ui.column().classes('p-3 w-full'):
-                            # 计算成功率，用于判断最终状态
-                            total = report['total_tests']
-                            passed = report['passed_tests']
-                            failed = report['failed_tests']
-                            skipped = report['skipped_tests']
-                            success_rate = (passed / (total - skipped) * 100) if (total - skipped) > 0 else 100
-                            
-                            # 根据数据库状态和成功率重新判断状态
-                            db_status = report['status']
-                            
-                            # 优先检查是否仍在运行中
-                            if db_status == 'running':
-                                effective_status = 'running'
-                            elif db_status == 'completed':
-                                # 只有测试真正完成时，才根据成功率判断最终状态
-                                if success_rate < 95:
-                                    effective_status = 'failed'
-                                else:
-                                    effective_status = 'completed'
-                            else:
-                                effective_status = db_status
-                            
-                            # 标题行
-                            with ui.row().classes('justify-between items-center w-full mb-2'):
-                                ui.label(f"测试: {report['test_path']}").classes('font-semibold text-lg')
-                                status_color = self._get_status_color(effective_status)
-                                if effective_status == 'running':
-                                    status_display = '运行中'
-                                elif effective_status == 'failed':
-                                    status_display = '失败'
-                                elif effective_status == 'completed':
-                                    if failed == 0:
-                                        status_display = '通过'
-                                    else:
-                                        status_display = '完成'
+                effective_status = db_status
+            
+            with self.report_container:
+                with ui.card().classes('w-full mb-4 border rounded-lg shadow-sm hover:shadow-md transition-all duration-200') as card:
+                    with ui.column().classes('p-3 w-full'):
+                        with ui.row().classes('justify-between items-center w-full mb-2'):
+                            ui.label(f"测试: {report['test_path']}").classes('font-semibold text-lg')
+                            status_color = self._get_status_color(effective_status)
+                            if effective_status == 'running':
+                                status_display = '运行中'
+                            elif effective_status == 'failed':
+                                status_display = '失败'
+                            elif effective_status == 'completed':
+                                if failed == 0:
+                                    status_display = '通过'
                                 else:
                                     status_display = '完成'
-                                status_badge = ui.badge(status_display, color=status_color)
-                                
-                                # 根据实际状态添加悬浮提示
-                                if effective_status == 'running':
-                                    progress = ((passed + failed) / total * 100) if total > 0 else 0
-                                    status_badge.tooltip(f'测试运行中 - 已完成: {passed + failed} / {total} ({progress:.1f}%)')
-                                elif effective_status == 'completed':
-                                    if failed == 0:
-                                        status_badge.tooltip('测试通过 - 退出码为0，所有用例执行成功')
-                                    else:
-                                        status_badge.tooltip(f'测试完成 - 退出码为0且成功率≥95%({success_rate:.1f}%)，失败用例: {failed}个')
-                                elif effective_status == 'failed':
-                                    exit_code_info = report.get('exit_code', '')
-                                    if success_rate < 95:
-                                        status_badge.tooltip(f'测试失败 - 成功率<95%({success_rate:.1f}%)，失败用例: {failed}个')
-                                    else:
-                                        status_badge.tooltip(f'测试失败 - 退出码非0({exit_code_info})，成功率: {success_rate:.1f}%')
+                            else:
+                                status_display = '完成'
+                            status_badge = ui.badge(status_display, color=status_color)
                             
-                            # 详情行 - 网格布局
-                            with ui.grid(columns=3).classes('w-full gap-2 text-sm text-gray-500'):
-                                ui.label(f"开始时间: {report['start_time']}").classes('col-span-1')
-                                ui.label(f"Run ID: {report['run_id']}").classes('col-span-1')
-                                if report['duration']:
-                                    ui.label(f"运行时长: {self._format_duration(report['duration'])}").classes('col-span-1')
+                            if effective_status == 'running':
+                                progress = ((passed + failed) / total * 100) if total > 0 else 0
+                                status_badge.tooltip(f'测试运行中 - 已完成: {passed + failed} / {total} ({progress:.1f}%)')
+                            elif effective_status == 'completed':
+                                if failed == 0:
+                                    status_badge.tooltip('测试通过 - 退出码为0，所有用例执行成功')
                                 else:
-                                    ui.label(f"运行时长: -").classes('col-span-1')
-                            
-                            # 统计信息行 - 使用不同的背景色
-                            with ui.card().classes('w-full mt-2 bg-gray-50 rounded-md p-2'):
-                                with ui.grid(columns=4).classes('w-full gap-2 text-center'):
-                                    # 测试总数
-                                    with ui.column().classes('items-center'):
-                                        ui.label(str(report['total_tests'])).classes('text-lg font-bold')
-                                        ui.label('总数').classes('text-xs text-gray-500')
-                                    
-                                    # 通过测试数
-                                    with ui.column().classes('items-center'):
-                                        ui.label(str(report['passed_tests'])).classes('text-lg font-bold text-green-600')
-                                        ui.label('通过').classes('text-xs text-gray-500')
-                                    
-                                    # 失败测试数
-                                    with ui.column().classes('items-center'):
-                                        ui.label(str(report['failed_tests'])).classes('text-lg font-bold text-red-600')
-                                        ui.label('失败').classes('text-xs text-gray-500')
-                                    
-                                    # 跳过测试数
-                                    with ui.column().classes('items-center'):
-                                        ui.label(str(report['skipped_tests'])).classes('text-lg font-bold text-gray-500')
-                                        ui.label('跳过').classes('text-xs text-gray-500')
-                            
-                            # 按钮行
-                            with ui.row().classes('mt-3 w-full justify-between'):
-                                # 左侧：查看报告按钮和下载日志按钮
-                                with ui.row().classes('flex-grow-0 gap-2'):
-                                    if report['report_path']:
-                                        def create_view_handler(report_path, run_id):
-                                            def view_handler():
-                                                self._view_report(report_path, run_id)
-                                            return view_handler
-                                        
-                                        view_button = ui.button(
-                                            '查看报告',
-                                            on_click=create_view_handler(report['report_path'], report['run_id']),
-                                            color='primary',
-                                            icon='article'
-                                        ).props('flat rounded')
-                                    else:
-                                        ui.label('无报告文件').classes('text-gray-400')
-                                    
-                                    # 添加下载日志按钮
-                                    def create_download_handler(run_id):
-                                        def download_handler():
-                                            self._download_logs(run_id)
-                                        return download_handler
-                                    
-                                    download_button = ui.button(
-                                        '下载日志',
-                                        on_click=create_download_handler(report['run_id']),
-                                        color='secondary',
-                                        icon='download'
-                                    ).props('flat rounded')
+                                    status_badge.tooltip(f'测试完成 - 退出码为0且成功率≥95%({success_rate:.1f}%)，失败用例: {failed}个')
+                            elif effective_status == 'failed':
+                                exit_code_info = report.get('exit_code', '')
+                                if success_rate < 95:
+                                    status_badge.tooltip(f'测试失败 - 成功率<95%({success_rate:.1f}%)，失败用例: {failed}个')
+                                else:
+                                    status_badge.tooltip(f'测试失败 - 退出码非0({exit_code_info})，成功率: {success_rate:.1f}%')
+                        
+                        with ui.grid(columns=3).classes('w-full gap-2 text-sm text-gray-500'):
+                            ui.label(f"开始时间: {report['start_time']}").classes('col-span-1')
+                            ui.label(f"Run ID: {run_id}").classes('col-span-1')
+                            if report['duration']:
+                                duration_label = ui.label(f"运行时长: {self._format_duration(report['duration'])}").classes('col-span-1')
+                            else:
+                                duration_label = ui.label(f"运行时长: -").classes('col-span-1')
+                        
+                        with ui.card().classes('w-full mt-2 bg-gray-50 rounded-md p-2'):
+                            with ui.grid(columns=4).classes('w-full gap-2 text-center'):
+                                with ui.column().classes('items-center'):
+                                    total_label = ui.label(str(total)).classes('text-lg font-bold')
+                                    ui.label('总数').classes('text-xs text-gray-500')
                                 
-                                # 右侧：删除按钮
-                                with ui.row().classes('flex-grow-0'):
-                                    # 修复lambda函数变量绑定问题 - 添加超详细debug信息
-                                    def create_delete_handler(run_id, report_path):
-                                        logger.info(f"🔧 创建删除处理器 - run_id={run_id}, report_path={report_path}")
-                                        def delete_handler():
-                                            logger.info(f"🖱️ 删除按钮被点击！事件触发 - run_id={run_id}, report_path={report_path}")
-                                            logger.info(f"📋 点击详情 - 当前时间={datetime.now()}, 处理器ID={id(delete_handler)}")
-                                            logger.info(f"🚀 开始调用 _confirm_delete_report 函数")
-                                            try:
-                                                self._confirm_delete_report(run_id, report_path)
-                                                logger.info(f"✅ _confirm_delete_report 调用成功")
-                                            except Exception as e:
-                                                logger.error(f"❌ _confirm_delete_report 调用失败: {str(e)}", exc_info=True)
-                                        return delete_handler
+                                with ui.column().classes('items-center'):
+                                    passed_label = ui.label(str(passed)).classes('text-lg font-bold text-green-600')
+                                    ui.label('通过').classes('text-xs text-gray-500')
+                                
+                                with ui.column().classes('items-center'):
+                                    failed_label = ui.label(str(failed)).classes('text-lg font-bold text-red-600')
+                                    ui.label('失败').classes('text-xs text-gray-500')
+                                
+                                with ui.column().classes('items-center'):
+                                    skipped_label = ui.label(str(skipped)).classes('text-lg font-bold text-gray-500')
+                                    ui.label('跳过').classes('text-xs text-gray-500')
+                        
+                        with ui.row().classes('mt-3 w-full justify-between'):
+                            with ui.row().classes('flex-grow-0 gap-2'):
+                                if report['report_path']:
+                                    def create_view_handler(report_path, run_id):
+                                        def view_handler():
+                                            self._view_report(report_path, run_id)
+                                        return view_handler
                                     
-                                    delete_button = ui.button(
-                                        '删除',
-                                        on_click=create_delete_handler(report['run_id'], report['report_path']),
-                                        color='negative',
-                                        icon='delete'
+                                    ui.button(
+                                        '查看报告',
+                                        on_click=create_view_handler(report['report_path'], report['run_id']),
+                                        color='primary',
+                                        icon='article'
                                     ).props('flat rounded')
-                                    
-                                    logger.info(f"✅ 为报告 {report['run_id']} 创建了删除按钮 - 按钮ID={id(delete_button)}")
-                                    logger.info(f"📍 按钮已绑定到run_id={report['run_id']}, report_path={report['report_path']}")
+                                else:
+                                    ui.label('无报告文件').classes('text-gray-400')
+                                
+                                def create_download_handler(run_id):
+                                    def download_handler():
+                                        self._download_logs(run_id)
+                                    return download_handler
+                                
+                                ui.button(
+                                    '下载日志',
+                                    on_click=create_download_handler(report['run_id']),
+                                    color='secondary',
+                                    icon='download'
+                                ).props('flat rounded')
+                            
+                            with ui.row().classes('flex-grow-0'):
+                                def create_delete_handler(run_id, report_path):
+                                    def delete_handler():
+                                        self._confirm_delete_report(run_id, report_path)
+                                    return delete_handler
+                                
+                                ui.button(
+                                    '删除',
+                                    on_click=create_delete_handler(report['run_id'], report['report_path']),
+                                    color='negative',
+                                    icon='delete'
+                                ).props('flat rounded')
+                    
+                    self.report_cards[run_id] = {
+                        'card': card,
+                        'data': report.copy(),
+                        'status_badge': status_badge,
+                        'duration_label': duration_label,
+                        'total_label': total_label,
+                        'passed_label': passed_label,
+                        'failed_label': failed_label,
+                        'skipped_label': skipped_label
+                    }
         
         logger.info(f"✅ 报告渲染完成，总共 {len(reports)} 个报告")
+    
+    def _update_changed_reports(self, reports: list) -> int:
+        """更新数据有变化的报告卡片（实时更新统计信息）"""
+        updated_count = 0
+        
+        for report in reports:
+            run_id = report['run_id']
+            if run_id not in self.report_cards:
+                logger.debug(f"[UPDATE] 跳过 {run_id}，不在 report_cards 中")
+                continue
+            
+            card_info = self.report_cards[run_id]
+            old_data = card_info['data']
+            
+            has_changes = (
+                old_data['total_tests'] != report['total_tests'] or
+                old_data['passed_tests'] != report['passed_tests'] or
+                old_data['failed_tests'] != report['failed_tests'] or
+                old_data['skipped_tests'] != report['skipped_tests'] or
+                old_data['status'] != report['status'] or
+                old_data['duration'] != report['duration']
+            )
+            
+            if not has_changes:
+                logger.debug(f"[UPDATE] 跳过 {run_id}，无变化: status={report['status']}, old_status={old_data['status']}")
+                continue
+            
+            logger.info(f"[UPDATE] 检测到 {run_id} 有变化: status={report['status']} -> old_status={old_data['status']}")
+            total = report['total_tests']
+            passed = report['passed_tests']
+            failed = report['failed_tests']
+            skipped = report['skipped_tests']
+            success_rate = (passed / (total - skipped) * 100) if (total - skipped) > 0 else 100
+            
+            db_status = report['status']
+            
+            if db_status == 'running':
+                effective_status = 'running'
+            elif db_status == 'completed':
+                if success_rate < 95:
+                    effective_status = 'failed'
+                else:
+                    effective_status = 'completed'
+            else:
+                effective_status = db_status
+            
+            card_info['total_label'].set_text(str(total))
+            card_info['passed_label'].set_text(str(passed))
+            card_info['failed_label'].set_text(str(failed))
+            card_info['skipped_label'].set_text(str(skipped))
+            
+            if report['duration']:
+                card_info['duration_label'].set_text(f"运行时长: {self._format_duration(report['duration'])}")
+            else:
+                card_info['duration_label'].set_text(f"运行时长: -")
+            
+            status_color = self._get_status_color(effective_status)
+            if effective_status == 'running':
+                status_display = '运行中'
+            elif effective_status == 'failed':
+                status_display = '失败'
+            elif effective_status == 'completed':
+                if failed == 0:
+                    status_display = '通过'
+                else:
+                    status_display = '完成'
+            else:
+                status_display = '完成'
+            
+            card_info['status_badge'].set_text(status_display)
+            card_info['status_badge'].props(f'color={status_color}')
+            
+            if effective_status == 'running':
+                progress = ((passed + failed) / total * 100) if total > 0 else 0
+                card_info['status_badge'].tooltip(f'测试运行中 - 已完成: {passed + failed} / {total} ({progress:.1f}%)')
+            elif effective_status == 'completed':
+                if failed == 0:
+                    card_info['status_badge'].tooltip('测试通过 - 退出码为0，所有用例执行成功')
+                else:
+                    card_info['status_badge'].tooltip(f'测试完成 - 退出码为0且成功率≥95%({success_rate:.1f}%)，失败用例: {failed}个')
+            elif effective_status == 'failed':
+                exit_code_info = report.get('exit_code', '')
+                if success_rate < 95:
+                    card_info['status_badge'].tooltip(f'测试失败 - 成功率<95%({success_rate:.1f}%)，失败用例: {failed}个')
+                else:
+                    card_info['status_badge'].tooltip(f'测试失败 - 退出码非0({exit_code_info})，成功率: {success_rate:.1f}%')
+            
+            card_info['data'] = report.copy()
+            updated_count += 1
+        
+        return updated_count
     
     def _get_status_display(self, status: str) -> str:
         """获取状态的显示文本"""

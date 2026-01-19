@@ -14,22 +14,8 @@ from config.settings import settings
 
 # 配置日志
 def _setup_logger():
-    log_dir = settings.LOG_PATH
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d")}.log')
-    
     logger = logging.getLogger('RemoteTestMonitor.TestService')
     logger.setLevel(logging.DEBUG)
-    
-    # 清除已有处理器
-    logger.handlers.clear()
-    
-    # 文件处理器
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(file_handler)
-    
     return logger
 
 logger = _setup_logger()

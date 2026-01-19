@@ -31,11 +31,14 @@ class Settings(BaseSettings):
 
     # 测试配置
     TEST_REPORTS_PATH: str = os.path.join("reports")
+    TEMP_PATH: str = os.path.join("reports", "temp")
     PYTEST_ARGS: list = ["-v", "--html=report.html"]
 
     # 日志配置
     LOG_LEVEL: str = "INFO"
     LOG_PATH: str = os.path.join("reports", "logs")
+    LOG_FORMAT: str = "[%(asctime)s.%(msecs)03d] - [%(filename)s:%(lineno)d] - [%(levelname)s] - %(message)s"
+    LOG_DATE_FORMAT: str = "%Y-%m-%d %H:%M:%S"
 
     class Config:
         env_file = ".env"
