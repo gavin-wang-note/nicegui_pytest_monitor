@@ -29,6 +29,7 @@ class TestRun(BaseModel):
     report_path: Optional[str] = None
     node_name: str = "localhost"
     exit_code: Optional[int] = None  # 记录pytest退出码
+    execution_type: str = "local"  # local or remote
 
     class Config:
         orm_mode = True

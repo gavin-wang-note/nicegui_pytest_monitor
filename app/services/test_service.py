@@ -36,7 +36,6 @@ class TestService:
         """开始执行测试"""
         run_id = str(uuid.uuid4())
         
-        # 创建测试运行记录
         test_run = TestRun(
             run_id=run_id,
             start_time=datetime.now(),
@@ -45,10 +44,67 @@ class TestService:
         )
         storage_service.save_test_run(test_run)
         
-        # 启动测试进程
         self._execute_test(run_id, test_path)
         
         return run_id
+    
+    def start_remote_test(self, machine_id: str, test_path: str) -> tuple[bool, str]:
+        """在远程机器上执行测试"""
+        from app.services.remote_machine_service import remote_machine_service
+        
+        machine = remote_machine_service.get_machine(machine_id)
+        if not machine:
+            return False, "机器不存在"
+        
+        success, message = remote_machine_service.test_connection(machine)
+        if not success:
+            return False, f"连接失败: {message}"
+        
+        run_id = str(uuid.uuid4())
+        
+        test_run = TestRun(
+            run_id=run_id,
+            start_time=datetime.now(),
+            status="running",
+            test_path=test_path,
+            node_name=f"{machine.name}({machine.host})",
+            execution_type="remote"
+        )
+        storage_service.save_test_run(test_run)
+        
+        def execute_remote():
+            try:
+                remote_machine_service.execute_test(machine, test_path, run_id)
+                
+                test_run = storage_service.get_test_run(run_id)
+                if test_run:
+                    test_run.status = "completed"
+                    test_run.end_time = datetime.now()
+                    storage_service.save_test_run(test_run)
+                    self._trigger_status_callbacks(test_run)
+                    
+                    test_log = TestLog(
+                        run_id=run_id,
+                        timestamp=datetime.now(),
+                        level="INFO",
+                        message=f"远程测试在 {machine.name} 上执行完成"
+                    )
+                    storage_service.save_test_log(test_log)
+                    self._trigger_log_callbacks(test_log)
+                    
+            except Exception as e:
+                logger.error(f"远程测试执行异常: {str(e)}")
+                test_run = storage_service.get_test_run(run_id)
+                if test_run:
+                    test_run.status = "failed"
+                    test_run.end_time = datetime.now()
+                    storage_service.save_test_run(test_run)
+                    self._trigger_status_callbacks(test_run)
+        
+        thread = threading.Thread(target=execute_remote, daemon=True)
+        thread.start()
+        
+        return True, run_id
     
     def stop_test(self, run_id: str) -> bool:
         """停止正在执行的测试"""
@@ -483,6 +539,11 @@ class TestService:
                 callback(test_run)
             except Exception as e:
                 logger.error(f"Status callback error: {e}")
+        
+        # 当测试完成或失败时，导出日志到文件
+        if test_run.status in ['completed', 'failed']:
+            logger.debug(f"[DEBUG] 测试状态为 {test_run.status}，自动导出日志: run_id={test_run.run_id}")
+            self.export_logs_to_file(test_run.run_id)
     
     def get_test_reports(self) -> List[Dict[str, Any]]:
         """获取测试报告列表"""
@@ -494,6 +555,38 @@ class TestService:
     def get_test_logs(self, run_id: str) -> List[TestLog]:
         """获取测试日志"""
         return storage_service.get_test_logs(run_id)
+    
+    def export_logs_to_file(self, run_id: str) -> str:
+        """将测试日志导出到文件"""
+        logger.debug(f"[DEBUG] 开始导出日志到文件: run_id={run_id}")
+        logs = self.get_test_logs(run_id)
+        logger.debug(f"[DEBUG] 获取到的日志数量: {len(logs) if logs else 0}")
+        if not logs:
+            logger.warning(f"没有找到测试日志: run_id={run_id}")
+            return None
+        
+        # 确保报告目录存在
+        logger.debug(f"[DEBUG] 报告目录: {settings.TEST_REPORTS_PATH}")
+        os.makedirs(settings.TEST_REPORTS_PATH, exist_ok=True)
+        
+        log_file_path = os.path.join(settings.TEST_REPORTS_PATH, f"{run_id}.log")
+        logger.debug(f"[DEBUG] 日志文件路径: {log_file_path}")
+        
+        try:
+            with open(log_file_path, 'w', encoding='utf-8') as f:
+                for log in logs:
+                    # 格式化日志行，与UI显示的格式一致
+                    timestamp_str = log.timestamp.strftime('%Y-%m-%d %H:%M:%S') if hasattr(log.timestamp, 'strftime') else str(log.timestamp)
+                    log_line = f"[{timestamp_str}] {log.message}\n"
+                    f.write(log_line)
+            
+            logger.info(f"日志已导出到文件: {log_file_path}")
+            return log_file_path
+        except Exception as e:
+            logger.error(f"导出日志到文件失败: {e}")
+            import traceback
+            logger.error(f"导出日志异常堆栈: {traceback.format_exc()}")
+            return None
 
 # 创建全局测试服务实例
 test_service = TestService()

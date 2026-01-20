@@ -56,13 +56,20 @@ class StorageService:
                     test_path TEXT NOT NULL,
                     report_path TEXT,
                     node_name TEXT NOT NULL DEFAULT 'localhost',
-                    exit_code INTEGER
+                    exit_code INTEGER,
+                    execution_type TEXT NOT NULL DEFAULT 'local'
                 )
             ''')
             
             # 如果 exit_code 列不存在，添加它
             try:
                 cursor.execute('ALTER TABLE test_runs ADD COLUMN exit_code INTEGER')
+            except sqlite3.OperationalError:
+                pass  # 列已存在
+            
+            # 如果 execution_type 列不存在，添加它
+            try:
+                cursor.execute('ALTER TABLE test_runs ADD COLUMN execution_type TEXT NOT NULL DEFAULT "local"')
             except sqlite3.OperationalError:
                 pass  # 列已存在
             
@@ -105,6 +112,24 @@ class StorageService:
                 )
             ''')
             
+            # 创建远程机器配置表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS remote_machines (
+                    machine_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    password TEXT,
+                    private_key_path TEXT,
+                    description TEXT,
+                    status TEXT DEFAULT 'unknown',
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME
+                )
+            ''')
+            
             conn.commit()
     
     def save_system_data(self, data: SystemData):
@@ -130,8 +155,13 @@ class StorageService:
     
     def get_system_data(self, start_time: datetime, end_time: datetime, node_name: str = "localhost") -> List[SystemData]:
         """获取指定时间范围的系统监控数据"""
-        with sqlite3.connect(self.db_path) as conn:
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            # 检查连接状态
             cursor = conn.cursor()
+            
+            # 执行查询
             cursor.execute('''
                 SELECT timestamp, cpu_percent, memory_percent, disk_percent, network_sent, network_recv, process_id, process_name, node_name
                 FROM system_data
@@ -140,7 +170,7 @@ class StorageService:
             ''', (start_time.isoformat(), end_time.isoformat(), node_name))
             
             rows = cursor.fetchall()
-            return [
+            result = [
                 SystemData(
                     timestamp=datetime.fromisoformat(row[0]),
                     cpu_percent=row[1],
@@ -153,6 +183,42 @@ class StorageService:
                     node_name=row[8]
                 ) for row in rows
             ]
+            return result
+        except sqlite3.DatabaseError as e:
+            logger.error(f"获取系统数据时数据库错误: {e}")
+            logger.info("尝试检查和修复数据库...")
+            
+            # 尝试修复数据库
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+                    
+            # 重新连接并运行完整性检查
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('PRAGMA integrity_check')
+                check_result = cursor.fetchone()
+                
+                if check_result and check_result[0] != 'ok':
+                    logger.error(f"数据库完整性检查失败: {check_result[0]}")
+                    # 返回空列表避免应用崩溃
+                    return []
+                else:
+                    # 完整性检查通过，可能是临时连接问题
+                    logger.info("数据库完整性检查通过，重新尝试查询")
+                    return []
+            except Exception as e2:
+                logger.error(f"修复数据库时发生错误: {e2}")
+                return []
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
     
     def get_running_tests(self) -> List[TestRun]:
         """获取所有正在运行的测试（只返回真正活跃的测试）"""
@@ -206,8 +272,8 @@ class StorageService:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT OR REPLACE INTO test_runs 
-                (run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code, execution_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 test_run.run_id,
                 test_run.start_time.isoformat(),
@@ -220,7 +286,8 @@ class StorageService:
                 test_run.test_path,
                 test_run.report_path,
                 test_run.node_name,
-                test_run.exit_code
+                test_run.exit_code,
+                test_run.execution_type
             ))
             conn.commit()
     
@@ -229,7 +296,7 @@ class StorageService:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code
+                SELECT run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code, execution_type
                 FROM test_runs
                 WHERE run_id = ?
             ''', (run_id,))
@@ -248,7 +315,8 @@ class StorageService:
                     test_path=row[8],
                     report_path=row[9],
                     node_name=row[10],
-                    exit_code=row[11]
+                    exit_code=row[11],
+                    execution_type=row[12] if row[12] else "local"
                 )
             return None
     
@@ -363,7 +431,7 @@ class StorageService:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name
+                SELECT run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code, execution_type
                 FROM test_runs
                 ORDER BY start_time DESC
                 LIMIT ?
@@ -382,8 +450,11 @@ class StorageService:
                     skipped_tests=row[7],
                     test_path=row[8],
                     report_path=row[9],
-                    node_name=row[10]
-                ) for row in rows
+                    node_name=row[10],
+                    exit_code=row[11],
+                    execution_type=row[12] if row[12] else "local"
+                )
+                for row in rows
             ]
     
     def delete_test_run(self, run_id: str) -> bool:
@@ -419,6 +490,27 @@ class StorageService:
             logger.error(f"删除测试日志失败: {str(e)}")
             return False
     
+    def delete_all_test_runs(self) -> bool:
+        """删除所有测试运行记录、日志和结果"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # 删除所有测试日志
+                cursor.execute('DELETE FROM test_logs')
+                
+                # 删除所有测试结果
+                cursor.execute('DELETE FROM test_results')
+                
+                # 删除所有测试运行记录
+                cursor.execute('DELETE FROM test_runs')
+                
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"删除所有测试运行记录失败: {str(e)}")
+            return False
+    
     def export_to_csv(self, table_name: str, file_path: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None):
         """导出数据到CSV文件"""
         import csv
@@ -441,6 +533,134 @@ class StorageService:
                 writer = csv.writer(csvfile)
                 writer.writerow(headers)
                 writer.writerows(rows)
+    
+    def save_remote_machine(self, machine) -> bool:
+        """保存远程机器配置"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO remote_machines 
+                    (machine_id, name, host, port, platform, username, password, private_key_path, description, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    machine.machine_id,
+                    machine.name,
+                    machine.host,
+                    machine.port,
+                    machine.platform,
+                    machine.username,
+                    machine.password,
+                    machine.private_key_path,
+                    machine.description,
+                    machine.status,
+                    machine.created_at,
+                    machine.updated_at
+                ))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"保存远程机器配置失败: {str(e)}")
+            return False
+    
+    def get_remote_machine(self, machine_id: str):
+        """获取指定远程机器配置"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT machine_id, name, host, port, platform, username, password, private_key_path, description, status, created_at, updated_at
+                FROM remote_machines
+                WHERE machine_id = ?
+            ''', (machine_id,))
+            
+            row = cursor.fetchone()
+            if row:
+                from app.models import RemoteMachine
+                return RemoteMachine(
+                    machine_id=row[0],
+                    name=row[1],
+                    host=row[2],
+                    port=row[3],
+                    platform=row[4],
+                    username=row[5],
+                    password=row[6],
+                    private_key_path=row[7],
+                    description=row[8],
+                    status=row[9],
+                    created_at=row[10],
+                    updated_at=row[11]
+                )
+            return None
+    
+    def get_all_remote_machines(self) -> List:
+        """获取所有远程机器配置"""
+        from app.models import RemoteMachine
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT machine_id, name, host, port, platform, username, password, private_key_path, description, status, created_at, updated_at
+                FROM remote_machines
+                ORDER BY name
+            ''')
+            
+            rows = cursor.fetchall()
+            return [
+                RemoteMachine(
+                    machine_id=row[0],
+                    name=row[1],
+                    host=row[2],
+                    port=row[3],
+                    platform=row[4],
+                    username=row[5],
+                    password=row[6] if row[6] else None,
+                    private_key_path=row[7] if row[7] else None,
+                    description=row[8] if row[8] else None,
+                    status=row[9],
+                    created_at=row[10],
+                    updated_at=row[11]
+                ) for row in rows
+            ]
+    
+    def delete_remote_machine(self, machine_id: str) -> bool:
+        """删除远程机器配置"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM remote_machines WHERE machine_id = ?', (machine_id,))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"删除远程机器配置失败: {str(e)}")
+            return False
+    
+    def check_machine_exists(self, host: str, port: int, username: str) -> bool:
+        """检查机器配置是否已存在"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) FROM remote_machines
+                WHERE host = ? AND port = ? AND username = ?
+            ''', (host, port, username))
+            
+            count = cursor.fetchone()[0]
+            return count > 0
+    
+    def update_machine_status(self, machine_id: str, status: str) -> bool:
+        """更新机器状态"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE remote_machines
+                    SET status = ?, updated_at = ?
+                    WHERE machine_id = ?
+                ''', (status, datetime.now().isoformat(), machine_id))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"更新机器状态失败: {str(e)}")
+            return False
 
 # 创建全局存储服务实例
 storage_service = StorageService()

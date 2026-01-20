@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # 数据库配置
     DB_PATH: str = os.path.join("db", "monitor.db")
 
+    # 远程连接端口配置
+    SSH_PORT: int = 22  # Linux SSH 默认端口
+    WINRM_HTTP_PORT: int = 5985  # Windows WinRM HTTP 默认端口
+    WINRM_HTTPS_PORT: int = 5986  # Windows WinRM HTTPS 默认端口
+
     # 测试配置
     TEST_REPORTS_PATH: str = os.path.join("reports")
     TEMP_PATH: str = os.path.join("reports", "temp")

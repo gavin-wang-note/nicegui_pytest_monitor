@@ -1,5 +1,6 @@
 from .system_data import SystemData, ProcessData
 from .test_data import TestResult, TestRun, TestQueueItem, TestLog
+from .machine_data import RemoteMachine, MachinePlatform, MachineStatus
 
 __all__ = [
     "SystemData",
@@ -7,5 +8,8 @@ __all__ = [
     "TestResult",
     "TestRun",
     "TestQueueItem",
-    "TestLog"
+    "TestLog",
+    "RemoteMachine",
+    "MachinePlatform",
+    "MachineStatus"
 ]
