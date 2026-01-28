@@ -60,6 +60,13 @@ class TestService:
         if not success:
             return False, f"连接失败: {message}"
         
+        # 检查远程测试路径是否存在
+        exists, error_msg = remote_machine_service.check_remote_path_exists(machine, test_path)
+        if not exists:
+            if error_msg:
+                return False, f"远程测试路径不存在: {test_path} ({error_msg})"
+            return False, f"远程测试路径不存在: {test_path}"
+        
         run_id = str(uuid.uuid4())
         
         test_run = TestRun(

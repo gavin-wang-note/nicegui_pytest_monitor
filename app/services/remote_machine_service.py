@@ -229,9 +229,200 @@ class RemoteMachineService:
         except Exception as e:
             return False, "", f"WinRM执行失败: {str(e)}"
     
+    def _format_path_for_platform(self, path: str, platform: str) -> str:
+        """根据目标平台格式化路径"""
+        if not path:
+            return path
+            
+        if platform == "windows":
+            # 处理Windows路径格式
+            # 1. 替换正斜杠为反斜杠
+            formatted = path.replace('/', '\\')
+            # 2. 处理UNC路径（保留格式）
+            if formatted.startswith('\\\\'):
+                return formatted
+            # 3. 处理驱动器号格式（确保大小写一致）
+            if len(formatted) >= 2 and formatted[1] == ':':
+                formatted = formatted[0].upper() + formatted[1:]
+            return formatted
+        elif platform == "linux":
+            # 处理Linux路径格式
+            # 1. 替换反斜杠为正斜杠
+            formatted = path.replace('\\', '/')
+            # 2. 确保路径以/开头（绝对路径）
+            if not formatted.startswith('/'):
+                logger.warning(f"Linux路径应该是绝对路径，当前路径: {path}")
+            return formatted
+        else:
+            return path
+    
+    def check_remote_path_exists(self, machine: RemoteMachine, path: str) -> tuple[bool, str]:
+        """检查远程路径是否存在"""
+        try:
+            logger.debug(f"[路径检查] 开始检查远程路径，机器: {machine.name}, 平台: {machine.platform}, 原始路径: {path}")
+            
+            if machine.platform == "linux":
+                formatted_path = self._format_path_for_platform(path, "linux")
+                logger.debug(f"[路径检查] Linux平台，格式化后路径: {formatted_path}")
+                return self._check_linux_path_exists(machine, formatted_path)
+            elif machine.platform == "windows":
+                formatted_path = self._format_path_for_platform(path, "windows")
+                logger.debug(f"[路径检查] Windows平台，格式化后路径: {formatted_path}")
+                return self._check_windows_path_exists(machine, formatted_path)
+            else:
+                logger.error(f"[路径检查] 不支持的平台: {machine.platform}")
+                return False, f"不支持的平台: {machine.platform}"
+        except Exception as e:
+            logger.error(f"检查远程路径失败: {str(e)}")
+            return False, f"检查失败: {str(e)}"
+    
+    def _check_linux_path_exists(self, machine: RemoteMachine, path: str) -> tuple[bool, str]:
+        """检查Linux远程路径是否存在"""
+        import paramiko
+        import shlex
+        
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        connect_kwargs = {
+            'hostname': machine.host,
+            'port': machine.port,
+            'username': machine.username,
+            'timeout': 30
+        }
+        
+        if machine.private_key_path:
+            key = paramiko.RSAKey.from_private_key_file(machine.private_key_path)
+            connect_kwargs['pkey'] = key
+        elif machine.password:
+            connect_kwargs['password'] = machine.password
+        
+        ssh.connect(**connect_kwargs)
+        
+        # 使用更安全的方式检查路径是否存在，通过转义路径避免特殊字符问题
+        escaped_path = shlex.quote(path)
+        command = f'if [ -e {escaped_path} ]; then echo "exists"; else echo "not exists"; fi'
+        
+        logger.debug(f"[Linux路径检查] 执行命令: {command}")
+        stdin, stdout, stderr = ssh.exec_command(command, timeout=30)
+        
+        output = stdout.read().decode('utf-8').strip()
+        error = stderr.read().decode('utf-8').strip()
+        
+        ssh.close()
+        
+        logger.debug(f"[Linux路径检查] 命令输出: {output}")
+        if error:
+            logger.debug(f"[Linux路径检查] 命令错误: {error}")
+            # 提供更友好的错误信息
+            if len(error) > 100:
+                return False, "检查失败: 路径不存在或权限不足"
+            return False, f"检查失败: {error}"
+        
+        return output == "exists", ""
+    
+    def _check_windows_path_exists(self, machine: RemoteMachine, path: str) -> tuple[bool, str]:
+        """检查Windows远程路径是否存在"""
+        import winrm
+        import xml.etree.ElementTree as ET
+        
+        session = winrm.Session(
+            f'http://{machine.host}:{machine.port}/wsman',
+            auth=(machine.username, machine.password or ''),
+            transport='ntlm',
+            server_cert_validation='ignore'
+        )
+        
+        # 转义单引号
+        escaped_path = path.replace("'", "''")
+        
+        # 使用PowerShell检查路径是否存在，使用-LiteralPath参数处理特殊字符
+        check_script = f"""$path = '{escaped_path}'
+if (Test-Path -LiteralPath $path) {{
+    Write-Output "exists"
+}} else {{
+    Write-Output "not exists"
+}}
+"""
+        
+        logger.debug(f"[Windows路径检查] 格式化路径: {path}")
+        logger.debug(f"[Windows路径检查] 转义后路径: {escaped_path}")
+        logger.debug(f"[Windows路径检查] 执行PowerShell脚本: {check_script}")
+        
+        result = session.run_ps(check_script)
+        output = result.std_out.decode('utf-8', errors='replace').strip()
+        error = result.std_err.decode('utf-8', errors='replace').strip()
+        
+        logger.debug(f"[Windows路径检查] 命令输出: {output}")
+        if error:
+            logger.debug(f"[Windows路径检查] 命令错误: {error}")
+            # 尝试解析CLIXML格式的错误信息
+            if error.strip().startswith('#< CLIXML'):
+                try:
+                    # 提取XML部分
+                    xml_start = error.find('<Objs')
+                    if xml_start != -1:
+                        xml_content = error[xml_start:]
+                        root = ET.fromstring(xml_content)
+                        
+                        # 只有当找到真正的错误元素时才视为错误
+                        error_elements = root.findall('.//S[@S="Error"]')
+                        if error_elements:
+                            error_msg = error_elements[-1].text
+                            if error_msg:
+                                return False, f"检查失败: {error_msg}"
+                        
+                        # 如果没有找到错误元素，忽略CLIXML输出
+                        logger.debug(f"[Windows路径检查] CLIXML包含非错误信息，忽略")
+                except Exception as e:
+                    logger.debug(f"解析CLIXML错误失败: {str(e)}")
+            else:
+                # 非CLIXML错误，返回失败
+                if len(error) > 100:
+                    return False, "检查失败: 路径不存在或权限不足"
+                return False, f"检查失败: {error}"
+        
+        return output == "exists", ""
+    
     def execute_test(self, machine: RemoteMachine, test_path: str, run_id: str) -> bool:
         """在远程机器上执行测试"""
         try:
+            # 首先检查测试路径是否存在
+            exists, error_msg = self.check_remote_path_exists(machine, test_path)
+            if not exists:
+                logger.error(f"远程测试路径不存在: {test_path}, {error_msg}")
+                # 记录错误日志
+                from app.models import TestLog, TestRun
+                from app.services.storage_service import storage_service
+                from datetime import datetime
+                
+                # 更新测试运行状态为失败
+                test_run = storage_service.get_test_run(run_id)
+                if test_run:
+                    test_run.status = "failed"
+                    test_run.end_time = datetime.now()
+                    storage_service.save_test_run(test_run)
+                    
+                # 保存错误日志
+                error_message = f"测试失败: 远程路径不存在: {test_path}"
+                if error_msg:
+                    error_message += f" ({error_msg})"
+                    
+                test_log = TestLog(
+                    run_id=run_id,
+                    timestamp=datetime.now(),
+                    level="ERROR",
+                    message=error_message
+                )
+                storage_service.save_test_log(test_log)
+                
+                # 触发状态回调
+                from app.services.test_service import test_service
+                if test_run:
+                    test_service._trigger_status_callbacks(test_run)
+                    
+                return False
+            
             if machine.platform == "linux":
                 return self._execute_test_linux(machine, test_path, run_id)
             elif machine.platform == "windows":
@@ -535,7 +726,7 @@ class RemoteMachineService:
             try:
                 # 首先检查远程报告文件是否存在
                 check_script = f"""$remotePath = "{powershell_remote_path}"
-if (Test-Path $remotePath) {{
+if (Test-Path -LiteralPath $remotePath) {{
     Write-Output "Found"
 }} else {{
     Write-Output "Not found"

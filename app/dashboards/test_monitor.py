@@ -665,7 +665,11 @@ class TestMonitor:
                     self.test_status.classes(remove='text-red-500 text-green-500').classes('text-blue-500')
                     ui.notify(f'远程测试已启动: {machine.name}', type='success')
                 else:
-                    ui.notify(f'启动失败: {run_id}', type='error')
+                    # 检查是否是路径不存在的错误
+                    if '路径不存在' in run_id:
+                        ui.notify(run_id, type='warning', duration=5)
+                    else:
+                        ui.notify(f'启动失败: {run_id}', type='error')
             except Exception as e:
                 logger.error(f"远程测试启动异常: {e}")
                 ui.notify(f'测试启动失败: {str(e)}', type='error')

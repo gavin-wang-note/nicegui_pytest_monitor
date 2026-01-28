@@ -95,9 +95,17 @@ class RemoteTestMonitorApp:
             # 初始化日志内容
             self._refresh_logs()
             
-            # 设置自动刷新定时器
-            if not hasattr(self, 'log_timer'):
-                self.log_timer = ui.timer(interval=self.refresh_interval.value, callback=self._auto_refresh_logs)
+            # 设置自动刷新定时器 - 确保只有一个定时器实例
+            self.logger.debug(f"正在创建日志自动刷新定时器，间隔: {self.refresh_interval.value}秒，自动刷新开关状态: {self.auto_refresh.value}")
+            
+            # 移除旧的定时器
+            if hasattr(self, 'log_timer') and self.log_timer:
+                self.logger.debug(f"移除旧的日志自动刷新定时器")
+                self.log_timer.cancel()
+                
+            # 创建新的定时器，直接启动
+            self.log_timer = ui.timer(interval=self.refresh_interval.value, callback=self._auto_refresh_logs)
+            self.logger.debug(f"新的日志自动刷新定时器已创建并启动")
     
     def _on_interval_change(self, e):
         """刷新间隔变化时的处理"""
@@ -105,15 +113,33 @@ class RemoteTestMonitorApp:
         if hasattr(self, 'log_timer') and self.log_timer:
             self.log_timer.interval = e.value
 
-    def _toggle_refresh_slider(self, value):
-        """控制刷新滑块的显示/隐藏"""
-        visible = bool(value)
+    def _toggle_refresh_slider(self, e):
+        """控制刷新滑块的显示/隐藏以及定时器的启动/停止"""
+        visible = e.value
         self.refresh_slider_container.visible = visible
+        
+        # 处理定时器逻辑
+        if hasattr(self, 'log_timer') and self.log_timer:
+            if visible:
+                # 启动定时器
+                if not self.log_timer.active:
+                    self.logger.debug(f"启动日志自动刷新定时器，间隔: {self.refresh_interval.value}秒")
+                    self.log_timer.start()
+            else:
+                # 停止定时器
+                if self.log_timer.active:
+                    self.logger.debug(f"停止日志自动刷新定时器")
+                    self.log_timer.pause()
     
     def _auto_refresh_logs(self):
         """自动刷新日志"""
-        if self.auto_refresh.value:
-            self._refresh_logs()
+        try:
+            if self.auto_refresh.value:
+                self.logger.debug(f"执行日志自动刷新，当前时间: {datetime.now()}")
+                self._refresh_logs()
+        except Exception as e:
+            self.logger.error(f"自动刷新日志失败: {str(e)}")
+            self.log_output.push(f'自动刷新日志失败: {str(e)}')
     
     def _find_latest_log_file(self):
         """查找最近的日志文件"""
@@ -149,17 +175,53 @@ class RemoteTestMonitorApp:
                 else:
                     self.log_info.text = f'显示历史日志: {os.path.basename(log_file)}'
             
-            # 读取日志内容
-            with open(log_file, 'r', encoding='utf-8') as f:
-                log_content = f.read()
+            # 读取日志内容 - 优化性能
+            try:
+                with open(log_file, 'r', encoding='utf-8') as f:
+                    # 检查文件大小，对于大文件只读取最后5000行
+                    f.seek(0, 2)
+                    file_size = f.tell()
+                    
+                    # 如果文件大于5MB，只读取最后5000行
+                    if file_size > 5 * 1024 * 1024:
+                        lines = []
+                        buffer = ''
+                        f.seek(max(0, file_size - 500000))  # 从文件末尾附近开始读取
+                        
+                        while True:
+                            chunk = f.read(1024)
+                            if not chunk:
+                                break
+                            buffer += chunk
+                            
+                            # 按行分割
+                            if '\n' in buffer:
+                                parts = buffer.split('\n')
+                                lines.extend(parts[:-1])
+                                buffer = parts[-1]
+                        
+                        if buffer:
+                            lines.append(buffer)
+                            
+                        # 取最后5000行
+                        log_content = '\n'.join(lines[-5000:])
+                    else:
+                        # 小文件直接读取全部
+                        f.seek(0)
+                        log_content = f.read()
+            except Exception as e:
+                self.logger.error(f"读取日志文件失败: {str(e)}")
+                self.log_output.push(f'读取日志文件失败: {str(e)}')
+                self.log_info.text = '读取日志失败'
+                return
             
             # 根据级别筛选日志
             level_filter = self.log_level.value
             if level_filter != '全部':
-                # 简单的日志级别筛选
+                # 优化的日志级别筛选
                 filtered_lines = []
                 for line in log_content.split('\n'):
-                    if level_filter in line:
+                    if line and level_filter in line:
                         filtered_lines.append(line)
                 log_content = '\n'.join(filtered_lines)
             
@@ -169,8 +231,10 @@ class RemoteTestMonitorApp:
             
             # 更新日志信息
             log_lines = len([l for l in log_content.split('\n') if l.strip()])
-            self.log_info.text = f'显示 {log_lines} 行日志'
-            self.log_time.text = f'最后更新: {datetime.now().strftime("%H:%M:%S")}'
+            current_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self.log_info.text = f'显示 {log_lines} 行日志 - 自动刷新: {self.auto_refresh.value} 间隔: {self.refresh_interval.value}秒'
+            self.log_time.text = f'最后更新: {current_time}'
+            self.logger.debug(f"日志刷新完成，行: {log_lines}，时间: {current_time}")
             
         except Exception as e:
             self.logger.error(f"读取日志文件失败: {str(e)}")
