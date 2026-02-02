@@ -35,11 +35,11 @@ class TestMonitor:
     def create_dashboard(self):
         """创建测试监控仪表板"""
         with ui.card().classes('w-full'):
-            ui.label('测试监控').classes('text-xl font-bold mb-4')
+            ui.label('测试监控').classes('text-2xl font-bold mb-4')
             
             with ui.tabs().classes('w-full mb-4') as self.tabs:
-                self.tab_test = ui.tab('测试执行')
-                self.tab_machine = ui.tab('机器管理')
+                self.tab_test = ui.tab('测试执行', icon='play_arrow').classes('text-lg')
+                self.tab_machine = ui.tab('机器管理', icon='computer').classes('text-lg')
             
             with ui.tab_panels(self.tabs, value=self.tab_test).classes('w-full'):
                 with ui.tab_panel(self.tab_test):
@@ -114,6 +114,44 @@ class TestMonitor:
         with ui.row().classes('w-full mb-4'):
             ui.button('添加机器', on_click=self._show_add_machine_dialog, icon='add').classes('mr-2')
             ui.button('刷新', on_click=self._refresh_machine_list, icon='refresh')
+        
+        # 机器状态分布饼图
+        with ui.card().classes('w-full bg-white border border-gray-200 rounded-lg shadow-sm hover:shadow-md transition-all duration-200 mb-6'):
+            ui.label('机器状态分布').classes('text-lg font-semibold mb-4 text-gray-700')
+            self.machine_status_chart = ui.echart({
+                'title': {
+                    'text': '机器状态分布',
+                    'left': 'center'
+                },
+                'tooltip': {
+                    'trigger': 'item',
+                    'formatter': '{b}: {c} ({d}%)'
+                },
+                'legend': {
+                    'orient': 'vertical',
+                    'left': 'left'
+                },
+                # 统一状态颜色：与表格中显示的颜色保持一致
+                'color': ['#d1fae5', '#fee2e2', '#fef3c7'],  # 浅绿色(在线), 浅红色(离线), 浅黄色(未知)
+                'series': [{
+                    'name': '机器状态',
+                    'type': 'pie',
+                    'radius': '60%',
+                    'center': ['50%', '50%'],
+                    'data': [],
+                    'label': {
+                        'formatter': '{b} {c}',  # 在饼图连线上增加统计计数
+                        'position': 'outside'
+                    },
+                    'emphasis': {
+                        'itemStyle': {
+                            'shadowBlur': 10,
+                            'shadowOffsetX': 0,
+                            'shadowColor': 'rgba(0, 0, 0, 0.5)'
+                        }
+                    }
+                }]
+            }).classes('w-full h-64')
         
         self.machine_table = ui.table(
             columns=[
@@ -206,6 +244,11 @@ class TestMonitor:
         
         self._load_machines()
         
+        # 统计机器状态
+        online = 0
+        offline = 0
+        unknown = 0
+        
         rows = []
         for machine in self._machines:
             status_text = "在线" if machine.status == "online" else ("离线" if machine.status == "offline" else "未知")
@@ -214,10 +257,13 @@ class TestMonitor:
             # 根据状态设置颜色
             if machine.status == "online":
                 status_class = 'bg-green-100 text-green-800 rounded px-2 py-1'
+                online += 1
             elif machine.status == "offline":
                 status_class = 'bg-red-100 text-red-800 rounded px-2 py-1'
+                offline += 1
             else:
                 status_class = 'bg-yellow-100 text-yellow-800 rounded px-2 py-1'
+                unknown += 1
             
             rows.append({
                 'machine_id': machine.machine_id,
@@ -232,6 +278,22 @@ class TestMonitor:
         
         self.machine_table._props['rows'] = rows
         self.machine_table.update()
+        
+        # 更新饼图数据
+        if self._machines:
+            chart_data = [
+                {'value': online, 'name': '在线'},
+                {'value': offline, 'name': '离线'},
+                {'value': unknown, 'name': '未知'}
+            ]
+            # 过滤掉数量为0的数据
+            chart_data = [item for item in chart_data if item['value'] > 0]
+        else:
+            # 没有机器时显示友好提示
+            chart_data = [{'value': 1, 'name': '暂无机器'}]
+        
+        self.machine_status_chart._props['options']['series'][0]['data'] = chart_data
+        self.machine_status_chart.update()
         
         options = {}
         for m in self._machines:

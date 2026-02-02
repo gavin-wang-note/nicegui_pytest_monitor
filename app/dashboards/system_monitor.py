@@ -20,7 +20,7 @@ class SystemMonitor:
     def create_dashboard(self):
         """创建系统监控仪表板"""
         with ui.card().classes('w-full p-4'):
-            ui.label('系统监控').classes('text-2xl font-bold mb-6 text-gray-700')
+            ui.label('系统监控').classes('text-3xl font-bold mb-6 text-gray-700')
 
             # 监控频率调整 - 现代化样式
             with ui.card().classes('mb-6 bg-blue-50 border border-blue-100 rounded-lg'):

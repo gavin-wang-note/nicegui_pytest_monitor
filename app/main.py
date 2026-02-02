@@ -48,7 +48,7 @@ class RemoteTestMonitorApp:
     def _create_log_panel(self):
         """创建日志面板"""
         with ui.card().classes('w-full p-4'):
-            ui.label('系统日志').classes('text-xl font-bold mb-4 text-gray-700')
+            ui.label('系统日志').classes('text-2xl font-bold mb-4 text-gray-700')
             
             # 日志控制区 - 现代化样式
             with ui.card().classes('mb-4 bg-blue-50 border border-blue-100 rounded-lg'):
