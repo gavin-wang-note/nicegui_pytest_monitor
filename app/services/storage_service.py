@@ -457,6 +457,37 @@ class StorageService:
                 for row in rows
             ]
     
+    def get_test_runs_by_time_range(self, start_time: datetime, end_time: datetime) -> List[TestRun]:
+        """根据时间范围获取测试运行记录"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT run_id, start_time, end_time, status, total_tests, passed_tests, failed_tests, skipped_tests, test_path, report_path, node_name, exit_code, execution_type
+                FROM test_runs
+                WHERE start_time BETWEEN ? AND ?
+                ORDER BY start_time ASC
+            ''', (start_time.isoformat(), end_time.isoformat()))
+            
+            rows = cursor.fetchall()
+            return [
+                TestRun(
+                    run_id=row[0],
+                    start_time=datetime.fromisoformat(row[1]),
+                    end_time=datetime.fromisoformat(row[2]) if row[2] else None,
+                    status=row[3],
+                    total_tests=row[4],
+                    passed_tests=row[5],
+                    failed_tests=row[6],
+                    skipped_tests=row[7],
+                    test_path=row[8],
+                    report_path=row[9],
+                    node_name=row[10],
+                    exit_code=row[11],
+                    execution_type=row[12] if row[12] else "local"
+                )
+                for row in rows
+            ]
+    
     def delete_test_run(self, run_id: str) -> bool:
         """删除指定测试运行记录"""
         try:

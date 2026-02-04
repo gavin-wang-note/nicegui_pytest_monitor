@@ -55,18 +55,26 @@ class MonitorService:
         while self._monitoring:
             start_time = time.time()
             
-            # 收集系统数据
-            system_data = self._collect_system_data()
-            
-            # 保存到数据库
-            storage_service.save_system_data(system_data)
-            
-            # 触发回调
-            for callback in self._system_data_callbacks:
-                try:
-                    callback(system_data)
-                except Exception as e:
-                    print(f"Callback error: {e}")
+            try:
+                # 收集系统数据
+                system_data = self._collect_system_data()
+                
+                # 保存到数据库（在单独的线程中执行，避免阻塞）
+                threading.Thread(target=lambda: storage_service.save_system_data(system_data), daemon=True).start()
+                
+                # 触发回调（在单独的线程池中执行，避免阻塞）
+                if self._system_data_callbacks:
+                    def execute_callbacks():
+                        for callback in self._system_data_callbacks:
+                            try:
+                                callback(system_data)
+                            except Exception as e:
+                                print(f"Callback error: {e}")
+                    
+                    # 使用单独的线程执行回调，避免阻塞监控循环
+                    threading.Thread(target=execute_callbacks, daemon=True).start()
+            except Exception as e:
+                print(f"Monitor loop error: {e}")
             
             # 等待下一个监控周期
             elapsed_time = time.time() - start_time
@@ -75,8 +83,8 @@ class MonitorService:
     
     def _collect_system_data(self) -> SystemData:
         """收集系统数据"""
-        # 获取系统级资源使用情况
-        cpu_percent = psutil.cpu_percent(interval=0.1)
+        # 获取系统级资源使用情况（使用interval=0提高效率，返回自上次调用以来的平均值）
+        cpu_percent = psutil.cpu_percent(interval=0)
         memory = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
         

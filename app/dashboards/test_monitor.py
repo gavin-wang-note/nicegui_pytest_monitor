@@ -96,6 +96,71 @@ class TestMonitor:
                 ui.button('清空日志', on_click=lambda: self.log_output.clear())
                 ui.button('下载日志', on_click=self._download_logs).classes('ml-2')
         
+        # 测试执行统计卡片
+        with ui.card().classes('w-full mt-4'):
+            ui.label('测试执行统计').classes('text-lg font-semibold mb-4')
+            
+            with ui.row().classes('w-full mb-4 items-center'):
+                ui.label('时间范围:').classes('mr-2')
+                self.time_range_select = ui.select(
+                    options={'1h': '最近1小时', '24h': '最近24小时', '7d': '最近7天', '30d': '最近30天'},
+                    value='24h',
+                    on_change=self._on_time_range_change
+                ).classes('w-40 mr-4')
+                ui.button('刷新统计', icon='refresh', on_click=self._refresh_test_statistics)
+            
+            # 测试通过率趋势图
+            self.test_pass_rate_chart = ui.echart({
+                'title': {
+                    'text': '测试通过率趋势',
+                    'left': 'center'
+                },
+                'tooltip': {
+                    'trigger': 'axis',
+                    'formatter': '{b}<br/>通过率: {c}%'
+                },
+                'xAxis': {
+                    'type': 'category',
+                    'data': [],
+                    'axisLabel': {
+                        'rotate': 45,
+                        'fontSize': 8
+                    }
+                },
+                'yAxis': {
+                    'type': 'value',
+                    'name': '通过率(%)',
+                    'min': 0,
+                    'max': 100,
+                    'interval': 10
+                },
+                'series': [{
+                    'name': '通过率',
+                    'type': 'line',
+                    'data': [],
+                    'smooth': True,
+                    'itemStyle': {
+                        'color': '#faad14'
+                    },
+                    'lineStyle': {
+                        'color': '#faad14'
+                    },
+                    'areaStyle': {
+                        'color': {
+                            'type': 'linear',
+                            'x': 0,
+                            'y': 0,
+                            'x2': 0,
+                            'y2': 1,
+                            'colorStops': [
+                                {'offset': 0, 'color': 'rgba(250, 173, 20, 0.3)'},
+                                {'offset': 1, 'color': 'rgba(250, 173, 20, 0.05)'}
+                            ]
+                        }
+                    }
+                }]
+            }).classes('w-full h-64')
+        
         with ui.card().classes('w-full mt-4'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
                 ui.label('测试报告').classes('text-lg font-semibold')
@@ -683,6 +748,145 @@ class TestMonitor:
         """机器选择处理"""
         pass
     
+    def _on_time_range_change(self, event=None):
+        """时间范围选择变化处理"""
+        self._refresh_test_statistics()
+    
+    def _refresh_test_statistics(self):
+        """刷新测试执行统计数据"""
+        time_range = self.time_range_select.value
+        
+        # 获取时间范围对应的秒数
+        if time_range == '1h':
+            seconds = 3600
+        elif time_range == '24h':
+            seconds = 86400
+        elif time_range == '7d':
+            seconds = 604800
+        elif time_range == '30d':
+            seconds = 2592000
+        else:
+            seconds = 86400  # 默认24小时
+        
+        import datetime
+        
+        # 计算时间范围
+        current_time = datetime.datetime.now()
+        start_time = current_time - datetime.timedelta(seconds=seconds)
+        
+        # 从数据库获取测试运行记录
+        test_runs = storage_service.get_test_runs_by_time_range(start_time, current_time)
+        logger.debug(f"[DEBUG] 获取到的测试运行记录数量: {len(test_runs)}")
+        for run in test_runs:
+            logger.debug(f"[DEBUG] 测试运行记录: run_id={run.run_id}, status={run.status}, start_time={run.start_time}, total_tests={run.total_tests}, passed_tests={run.passed_tests}")
+        
+        # 根据时间范围确定时间间隔
+        if time_range == '1h':
+            interval = datetime.timedelta(minutes=5)
+            points = 12
+        elif time_range == '24h':
+            interval = datetime.timedelta(hours=1)
+            points = 24
+        elif time_range == '7d':
+            interval = datetime.timedelta(hours=3)
+            points = 56
+        elif time_range == '30d':
+            interval = datetime.timedelta(days=1)
+            points = 30
+        else:
+            interval = datetime.timedelta(hours=1)
+            points = 24
+        
+        # 生成时间序列
+        time_points = []
+        for i in range(points):
+            time_point = start_time + interval * i
+            time_points.append(time_point)
+        logger.debug(f"[DEBUG] 生成的时间序列点数量: {len(time_points)}")
+        for i, tp in enumerate(time_points):
+            if i < len(time_points) - 1:
+                logger.debug(f"[DEBUG] 时间区间 {i}: {tp} - {time_points[i+1]}")
+            else:
+                logger.debug(f"[DEBUG] 时间区间 {i}: {tp} - {current_time}")
+        
+        # 初始化通过率数据为0
+        pass_rates = [0.0] * points
+        
+        # 如果有测试数据，按时间间隔分组并计算通过率
+        if test_runs:
+            # 初始化每个时间区间的测试计数和通过率总和
+            pass_rate_sums = [0.0] * points
+            test_counts = [0] * points
+            
+            # 遍历测试运行记录，计算每个时间区间的通过率
+            for run in test_runs:
+                # 跳过未完成的测试（只处理已完成、失败或停止的测试）
+                if run.status not in ['completed', 'failed', 'stopped'] or run.total_tests == 0:
+                    logger.debug(f"[DEBUG] 跳过测试 {run.run_id}: status={run.status}, total_tests={run.total_tests}")
+                    continue
+                
+                # 计算当前测试的通过率
+                test_pass_rate = (run.passed_tests / run.total_tests) * 100
+                logger.debug(f"[DEBUG] 测试 {run.run_id} 通过率: {test_pass_rate:.2f}%")
+                
+                # 找到测试运行所属的时间区间
+                found_interval = False
+                for i, time_point in enumerate(time_points):
+                    if i < points - 1:
+                        # 对于非最后一个区间，检查是否在当前时间点到下一个时间点之间
+                        if time_point <= run.start_time < time_points[i + 1]:
+                            # 累积通过率和测试计数
+                            pass_rate_sums[i] += test_pass_rate
+                            test_counts[i] += 1
+                            logger.debug(f"[DEBUG] 测试 {run.run_id} 被归类到时间区间 {i}: {time_point} - {time_points[i + 1]}")
+                            found_interval = True
+                            break
+                    else:
+                        # 对于最后一个区间，检查是否在当前时间点到current_time之间
+                        if time_point <= run.start_time <= current_time:
+                            # 累积通过率和测试计数
+                            pass_rate_sums[i] += test_pass_rate
+                            test_counts[i] += 1
+                            logger.debug(f"[DEBUG] 测试 {run.run_id} 被归类到时间区间 {i}: {time_point} - {current_time}")
+                            found_interval = True
+                            break
+                if not found_interval:
+                    logger.debug(f"[DEBUG] 测试 {run.run_id} 未找到匹配的时间区间，start_time={run.start_time}")
+                    # 尝试将测试归类到最接近的时间区间
+                    for i in range(points):
+                        if i == points - 1:
+                            # 归类到最后一个时间区间
+                            pass_rate_sums[i] += test_pass_rate
+                            test_counts[i] += 1
+                            logger.debug(f"[DEBUG] 测试 {run.run_id} 被强制归类到最后一个时间区间 {i}")
+                            found_interval = True
+                            break
+            
+            # 计算每个时间区间的平均通过率
+            for i in range(points):
+                if test_counts[i] > 0:
+                    pass_rates[i] = round(pass_rate_sums[i] / test_counts[i], 2)
+                    logger.debug(f"[DEBUG] 时间区间 {i}: 测试数量={test_counts[i]}, 平均通过率={pass_rates[i]:.2f}%")
+                else:
+                    logger.debug(f"[DEBUG] 时间区间 {i}: 无测试数据")
+        
+        logger.debug(f"[DEBUG] 最终通过率数据: {pass_rates}")
+        
+        # 格式化时间点
+        formatted_time_points = [tp.strftime('%Y-%m-%d %H:%M:%S') for tp in time_points]
+        
+        # 更新图表数据
+        try:
+            if hasattr(self, 'test_pass_rate_chart'):
+                self.test_pass_rate_chart._props['options']['xAxis']['data'] = formatted_time_points
+                self.test_pass_rate_chart._props['options']['series'][0]['data'] = pass_rates
+                self.test_pass_rate_chart.update()
+                logger.debug(f"[DEBUG] 图表数据更新成功")
+            else:
+                logger.error(f"[ERROR] test_pass_rate_chart 不存在")
+        except Exception as e:
+            logger.error(f"[ERROR] 更新图表数据失败: {e}")
+    
     def _show_edit_machine_dialog_by_id(self, machine_id: str):
         """根据ID显示编辑机器对话框"""
         logger.debug("[EDIT DIALOG DEBUG] 获取机器信息，machine_id: %s", machine_id)
@@ -906,6 +1110,11 @@ class TestMonitor:
         logger.info(f"[STATUS] 调用 _load_reports() 刷新UI")
         self._load_reports()
         logger.info(f"[STATUS] _load_reports() 执行完成")
+        
+        # 测试结束后自动刷新测试执行统计图表
+        logger.info(f"[STATUS] 自动刷新测试执行统计图表")
+        self._refresh_test_statistics()
+        logger.info(f"[STATUS] 测试执行统计图表刷新完成")
     
     def _download_logs(self, run_id: str = None):
         """下载测试日志"""
@@ -1008,7 +1217,72 @@ class TestMonitor:
         """清空所有报告和日志"""
         logger.info("开始清空所有报告和日志")
         
-        # 删除数据库中的所有测试运行记录
+        # 首先删除所有物理文件
+        import os
+        import glob
+        
+        # 获取报告和日志路径
+        from config.settings import settings
+        reports_path = settings.TEST_REPORTS_PATH
+        logs_path = settings.LOG_PATH
+        
+        # 记录路径信息便于调试
+        logger.debug(f"报告路径: {reports_path}")
+        logger.debug(f"日志路径: {logs_path}")
+        
+        # 检查路径是否存在
+        logger.debug(f"报告路径存在: {os.path.exists(reports_path)}")
+        logger.debug(f"日志路径存在: {os.path.exists(logs_path)}")
+        
+        # 删除所有UUID风格的.html和.log文件（兼容Windows和Linux）
+        def delete_uuid_files(paths, extension):
+            deleted_count = 0
+            
+            # 确保paths是列表
+            if not isinstance(paths, list):
+                paths = [paths]
+            
+            for path in paths:
+                if os.path.exists(path):
+                    # UUID格式：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+                    # 尝试多种模式以确保匹配所有可能的UUID文件
+                    patterns = [
+                        os.path.join(path, "*-*-*-*-*.{}".format(extension)),  # 标准UUID格式
+                        os.path.join(path, "*.{}".format(extension)),  # 所有该类型文件（兜底）
+                    ]
+                    
+                    deleted_files = set()
+                    for pattern in patterns:
+                        logger.debug(f"使用模式查找文件: {pattern}")
+                        files_to_delete = glob.glob(pattern)
+                        logger.debug(f"找到文件: {files_to_delete}")
+                        for file_path in files_to_delete:
+                            deleted_files.add(file_path)
+                    
+                    for file_path in deleted_files:
+                        try:
+                            # 只删除测试相关的UUID风格文件，不删除系统日志文件
+                            file_name = os.path.basename(file_path)
+                            logger.debug(f"检查文件: {file_name}")
+                            if "app_" not in file_name and "system_" not in file_name:
+                                os.remove(file_path)
+                                deleted_count += 1
+                                logger.debug(f"成功删除文件: {file_path}")
+                            else:
+                                logger.debug(f"保留系统日志文件: {file_path}")
+                        except Exception as e:
+                            logger.error(f"删除文件 {file_path} 失败: {e}")
+            return deleted_count
+        
+        # 删除报告文件（.html）- 在两个路径中查找
+        html_deleted = delete_uuid_files([reports_path, logs_path], "html")
+        logger.info(f"✅ 成功删除 {html_deleted} 个HTML报告文件")
+        
+        # 删除日志文件（.log）- 在两个路径中查找
+        log_deleted = delete_uuid_files([reports_path, logs_path], "log")
+        logger.info(f"✅ 成功删除 {log_deleted} 个日志文件")
+        
+        # 然后删除数据库中的所有测试运行记录
         success = storage_service.delete_all_test_runs()
         if success:
             logger.info("✅ 成功清空所有数据库记录")
@@ -1025,9 +1299,13 @@ class TestMonitor:
             # 刷新报告列表
             self._load_reports()
             
+            # 主动更新测试执行统计的趋势折线图
+            if hasattr(self, '_refresh_test_statistics'):
+                self._refresh_test_statistics()
+            
             # 显示成功提示
             from nicegui import ui
-            ui.notify('所有报告和日志已成功清空', color='green')
+            ui.notify(f'所有报告和日志已成功清空，共删除 {html_deleted} 个报告文件和 {log_deleted} 个日志文件', color='green')
         else:
             logger.error("❌ 清空报告和日志失败")
             from nicegui import ui
@@ -1064,7 +1342,8 @@ class TestMonitor:
                 'skipped_tests': run.skipped_tests,
                 'report_path': run.report_path,
                 'start_datetime': run.start_time,  # 用于排序
-                'execution_type': run.execution_type  # 本地/远程执行类型
+                'execution_type': run.execution_type,  # 本地/远程执行类型
+                'node_name': run.node_name  # 执行机器名称
             })
         
         # 按状态和时间排序：运行中的排在最前面，其他按开始时间倒序
@@ -1163,8 +1442,10 @@ class TestMonitor:
                             
                             # 添加执行类型徽章
                             execution_type = report.get('execution_type', 'local')
+                            node_name = report.get('node_name', 'localhost')
+                            
                             if execution_type == 'remote':
-                                execution_badge = ui.badge('远程执行', color='blue').props('ml-2')
+                                execution_badge = ui.badge(f'远程执行: {node_name}', color='blue').props('ml-2')
                             else:
                                 execution_badge = ui.badge('本地执行', color='green').props('ml-2')
                             

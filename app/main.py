@@ -55,7 +55,7 @@ class RemoteTestMonitorApp:
                 with ui.row().classes('items-center justify-between p-4 flex-wrap gap-4'):
                     # 左侧：自动刷新开关
                     with ui.row().classes('items-center'):
-                        self.auto_refresh = ui.switch('自动刷新', value=True)
+                        self.auto_refresh = ui.switch('自动刷新', value=False)
                     
                     # 中间：日志级别筛选
                     with ui.row().classes('items-center'):
@@ -72,12 +72,15 @@ class RemoteTestMonitorApp:
                         with ui.row().classes('items-center') as self.refresh_slider_container:
                             self.refresh_interval = ui.slider(
                                 min=1, max=30, value=2, step=1, 
-                                on_change=self._on_interval_change
+                                on_change=self._on_interval_change,
                             ).props('color=blue').classes('w-32')
                             self.interval_label = ui.label('2秒').classes('text-sm text-blue-600 font-bold')
                     
                     # 监听自动刷新开关来控制滑块显示/隐藏
                     self.auto_refresh.on_value_change(self._toggle_refresh_slider)
+                    
+                    # 根据自动刷新的初始值设置滑块的可见性
+                    self.refresh_slider_container.visible = self.auto_refresh.value
                     
                     # 按钮组
                     with ui.row().classes('items-center'):
@@ -103,8 +106,8 @@ class RemoteTestMonitorApp:
                 self.logger.debug(f"移除旧的日志自动刷新定时器")
                 self.log_timer.cancel()
                 
-            # 创建新的定时器，直接启动
-            self.log_timer = ui.timer(interval=self.refresh_interval.value, callback=self._auto_refresh_logs)
+            # 创建新的定时器，始终运行，但只在开关开启时执行刷新操作
+            self.log_timer = ui.timer(interval=self.refresh_interval.value, callback=self._auto_refresh_logs, active=True)
             self.logger.debug(f"新的日志自动刷新定时器已创建并启动")
     
     def _on_interval_change(self, e):
@@ -114,22 +117,12 @@ class RemoteTestMonitorApp:
             self.log_timer.interval = e.value
 
     def _toggle_refresh_slider(self, e):
-        """控制刷新滑块的显示/隐藏以及定时器的启动/停止"""
+        """控制刷新滑块的显示/隐藏"""
         visible = e.value
         self.refresh_slider_container.visible = visible
         
-        # 处理定时器逻辑
-        if hasattr(self, 'log_timer') and self.log_timer:
-            if visible:
-                # 启动定时器
-                if not self.log_timer.active:
-                    self.logger.debug(f"启动日志自动刷新定时器，间隔: {self.refresh_interval.value}秒")
-                    self.log_timer.start()
-            else:
-                # 停止定时器
-                if self.log_timer.active:
-                    self.logger.debug(f"停止日志自动刷新定时器")
-                    self.log_timer.pause()
+        # 定时器始终运行，由_auto_refresh_logs方法内部的条件判断控制是否执行刷新操作
+        self.logger.debug(f"自动刷新状态切换为: {'开启' if visible else '关闭'}")
     
     def _auto_refresh_logs(self):
         """自动刷新日志"""
