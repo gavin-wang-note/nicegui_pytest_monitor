@@ -797,29 +797,17 @@ class TestMonitor:
             interval = datetime.timedelta(hours=1)
             points = 24
         
-        # 生成时间序列
+        # 初始化时间点和通过率数据
         time_points = []
-        for i in range(points):
-            time_point = start_time + interval * i
-            time_points.append(time_point)
-        logger.debug(f"[DEBUG] 生成的时间序列点数量: {len(time_points)}")
-        for i, tp in enumerate(time_points):
-            if i < len(time_points) - 1:
-                logger.debug(f"[DEBUG] 时间区间 {i}: {tp} - {time_points[i+1]}")
-            else:
-                logger.debug(f"[DEBUG] 时间区间 {i}: {tp} - {current_time}")
+        pass_rates = []
         
-        # 初始化通过率数据为0
-        pass_rates = [0.0] * points
-        
-        # 如果有测试数据，按时间间隔分组并计算通过率
+        # 如果有测试数据，直接使用每个测试的实际时间和通过率
         if test_runs:
-            # 初始化每个时间区间的测试计数和通过率总和
-            pass_rate_sums = [0.0] * points
-            test_counts = [0] * points
+            # 按测试开始时间排序
+            sorted_test_runs = sorted(test_runs, key=lambda x: x.start_time)
             
-            # 遍历测试运行记录，计算每个时间区间的通过率
-            for run in test_runs:
+            # 遍历测试运行记录，获取每个测试的实际时间和通过率
+            for run in sorted_test_runs:
                 # 跳过未完成的测试（只处理已完成、失败或停止的测试）
                 if run.status not in ['completed', 'failed', 'stopped'] or run.total_tests == 0:
                     logger.debug(f"[DEBUG] 跳过测试 {run.run_id}: status={run.status}, total_tests={run.total_tests}")
@@ -827,48 +815,14 @@ class TestMonitor:
                 
                 # 计算当前测试的通过率
                 test_pass_rate = (run.passed_tests / run.total_tests) * 100
-                logger.debug(f"[DEBUG] 测试 {run.run_id} 通过率: {test_pass_rate:.2f}%")
+                test_pass_rate = round(test_pass_rate, 2)
+                logger.debug(f"[DEBUG] 测试 {run.run_id} 通过率: {test_pass_rate:.2f}%，执行时间: {run.start_time}")
                 
-                # 找到测试运行所属的时间区间
-                found_interval = False
-                for i, time_point in enumerate(time_points):
-                    if i < points - 1:
-                        # 对于非最后一个区间，检查是否在当前时间点到下一个时间点之间
-                        if time_point <= run.start_time < time_points[i + 1]:
-                            # 累积通过率和测试计数
-                            pass_rate_sums[i] += test_pass_rate
-                            test_counts[i] += 1
-                            logger.debug(f"[DEBUG] 测试 {run.run_id} 被归类到时间区间 {i}: {time_point} - {time_points[i + 1]}")
-                            found_interval = True
-                            break
-                    else:
-                        # 对于最后一个区间，检查是否在当前时间点到current_time之间
-                        if time_point <= run.start_time <= current_time:
-                            # 累积通过率和测试计数
-                            pass_rate_sums[i] += test_pass_rate
-                            test_counts[i] += 1
-                            logger.debug(f"[DEBUG] 测试 {run.run_id} 被归类到时间区间 {i}: {time_point} - {current_time}")
-                            found_interval = True
-                            break
-                if not found_interval:
-                    logger.debug(f"[DEBUG] 测试 {run.run_id} 未找到匹配的时间区间，start_time={run.start_time}")
-                    # 尝试将测试归类到最接近的时间区间
-                    for i in range(points):
-                        if i == points - 1:
-                            # 归类到最后一个时间区间
-                            pass_rate_sums[i] += test_pass_rate
-                            test_counts[i] += 1
-                            logger.debug(f"[DEBUG] 测试 {run.run_id} 被强制归类到最后一个时间区间 {i}")
-                            found_interval = True
-                            break
-            
-            # 计算每个时间区间的平均通过率
-            for i in range(points):
-                if test_counts[i] > 0:
-                    pass_rates[i] = round(pass_rate_sums[i] / test_counts[i], 2)
-                    logger.debug(f"[DEBUG] 时间区间 {i}: 测试数量={test_counts[i]}, 平均通过率={pass_rates[i]:.2f}%")
-                else:
-                    logger.debug(f"[DEBUG] 时间区间 {i}: 无测试数据")
+                # 添加到时间点和通过率列表
+                time_points.append(run.start_time)
+                pass_rates.append(test_pass_rate)
+        else:
+            logger.debug(f"[DEBUG] 无测试数据")
         
         logger.debug(f"[DEBUG] 最终通过率数据: {pass_rates}")
         
