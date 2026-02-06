@@ -6,6 +6,7 @@ from config.settings import settings
 import logging
 import os
 import time
+import sqlite3
 from datetime import datetime
 from typing import Dict, Any
 
@@ -239,6 +240,318 @@ class RemoteTestMonitorApp:
         self.log_output.clear()
         self.log_info.text = '日志显示已清空'
     
+    def _create_export_panel(self):
+        """创建导出面板"""
+        with ui.card().classes('w-full p-4'):
+            ui.label('数据导出').classes('text-2xl font-bold mb-4 text-gray-700')
+            
+            # 导出配置卡片
+            with ui.card().classes('mb-4 bg-blue-50 border border-blue-100 rounded-lg'):
+                with ui.column().classes('p-4'):
+                    # 数据类型选择
+                    with ui.row().classes('items-center mb-4'):
+                        ui.label('数据类型:').classes('text-sm text-gray-600 mr-2 w-24')
+                        self.export_data_type = ui.select(
+                            ['系统监控数据', '测试运行记录', '测试日志', '机器配置'],
+                            value='系统监控数据',
+                            on_change=self._on_export_data_type_change
+                        ).classes('flex-grow')
+                    
+                    # 时间范围选择 - 初始隐藏，根据数据类型显示
+                    with ui.column().classes('mb-4') as self.time_range_container:
+                        ui.label('时间范围:').classes('text-sm text-gray-600 mb-2')
+                        today = datetime.now().date()
+                        # 格式化日期为ISO字符串，因为NiceGUI的date组件可能需要字符串格式的日期
+                        today_str = today.strftime('%Y-%m-%d')
+                        with ui.row().classes('items-center'):
+                            self.start_time = ui.date().classes('mr-2')
+                            ui.label('至').classes('text-sm text-gray-600 mx-2')
+                            self.end_time = ui.date(value=today_str).classes('mr-2')
+                        
+                        # 添加日期选择验证
+                        def validate_date(e):
+                            """验证日期选择"""
+                            if e.sender.value:
+                                # 确保选择的日期不超过今天
+                                selected_date = datetime.strptime(e.sender.value, '%Y-%m-%d').date()
+                                if selected_date > today:
+                                    ui.notify('不能选择未来日期', type='warning')
+                                    e.sender.value = today_str
+                        
+                        # 为两个日期选择器添加验证
+                        self.start_time.on_value_change(validate_date)
+                        self.end_time.on_value_change(validate_date)
+                    
+                    # 导出格式选择
+                    with ui.row().classes('items-center mb-4'):
+                        ui.label('导出格式:').classes('text-sm text-gray-600 mr-2 w-24')
+                        self.export_format = ui.select(
+                            ['CSV', 'JSON'],
+                            value='CSV'
+                        ).classes('flex-grow')
+                    
+                    # 导出按钮
+                    with ui.row().classes('items-center justify-end'):
+                        self.export_button = ui.button('执行导出', on_click=self._export_data).props('color=primary')
+            
+            # 导出状态和结果显示
+            self.export_status = ui.label('').classes('text-sm text-gray-600 mb-4')
+            self.export_result = ui.column().classes('w-full')
+        
+        # 初始化时间范围显示
+        self._on_export_data_type_change()
+    
+    def _on_export_data_type_change(self, e=None):
+        """导出数据类型变化时的处理"""
+        # 只有系统监控数据、测试运行记录、测试日志需要时间范围
+        show_time_range = self.export_data_type.value in ['系统监控数据', '测试运行记录', '测试日志']
+        self.time_range_container.visible = show_time_range
+    
+    def _export_data(self):
+        """执行数据导出"""
+        try:
+            data_type = self.export_data_type.value
+            export_format = self.export_format.value
+            
+            # 准备导出参数
+            export_params = {
+                'data_type': data_type,
+                'format': export_format
+            }
+            
+            # 如果需要时间范围
+            if self.time_range_container.visible:
+                if not self.start_time.value:
+                    ui.notify('请选择开始时间', type='warning')
+                    return
+                if not self.end_time.value:
+                    ui.notify('请选择结束时间', type='warning')
+                    return
+                
+                # 确保日期值是datetime.date类型
+                start_date = self.start_time.value
+                end_date = self.end_time.value
+                
+                if isinstance(start_date, str):
+                    start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+                if isinstance(end_date, str):
+                    end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+                
+                start_time = datetime.combine(start_date, datetime.min.time())
+                end_time = datetime.combine(end_date, datetime.max.time())
+                export_params['start_time'] = start_time
+                export_params['end_time'] = end_time
+            
+            # 更新状态
+            self.export_status.text = f'正在导出 {data_type}...'
+            self.export_status.classes(remove='text-red-500').classes('text-blue-500')
+            
+            # 执行导出
+            file_path = self._perform_export(export_params)
+            
+            # 显示结果
+            self.export_status.text = f'导出完成: {os.path.basename(file_path)}'
+            self.export_status.classes(remove='text-blue-500').classes('text-green-500')
+            
+            # 提供下载链接
+            self.export_result.clear()
+            import urllib.parse
+            with self.export_result:
+                filename = os.path.basename(file_path)
+                encoded_filename = urllib.parse.quote(filename)
+                ui.link(f'下载 {filename}', f'/export/{encoded_filename}')
+                ui.label(f'文件位置: {file_path}').classes('text-xs text-gray-500 mt-2')
+            
+            ui.notify(f'{data_type} 导出成功', type='success')
+            
+        except Exception as e:
+            self.export_status.text = f'导出失败: {str(e)}'
+            self.export_status.classes(remove='text-blue-500 text-green-500').classes('text-red-500')
+            ui.notify(f'导出失败: {str(e)}', type='error')
+    
+    def _perform_export(self, params):
+        """执行实际的导出操作"""
+        import csv
+        import json
+        import tempfile
+        import os
+        from datetime import datetime
+        
+        data_type = params['data_type']
+        export_format = params['format']
+        
+        # 准备导出目录
+        export_dir = os.path.join(os.getcwd(), 'export')
+        os.makedirs(export_dir, exist_ok=True)
+        
+        # 生成文件名
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        filename = f'{data_type}_{timestamp}.{export_format.lower()}'
+        file_path = os.path.join(export_dir, filename)
+        
+        if data_type == '系统监控数据':
+            # 导出系统监控数据
+            start_time = params['start_time']
+            end_time = params['end_time']
+            data = storage_service.get_system_data(start_time, end_time)
+            
+            if export_format == 'CSV':
+                with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    # 写入表头
+                    writer.writerow(['时间戳', 'CPU使用率(%)', '内存使用率(%)', '磁盘使用率(%)', '发送流量(KB)', '接收流量(KB)', '进程ID', '进程名称', '节点名称'])
+                    # 写入数据
+                    for item in data:
+                        writer.writerow([
+                            item.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                            item.cpu_percent,
+                            item.memory_percent,
+                            item.disk_percent,
+                            item.network_sent / 1024,
+                            item.network_recv / 1024,
+                            item.process_id,
+                            item.process_name,
+                            item.node_name
+                        ])
+            else:  # JSON
+                export_data = []
+                for item in data:
+                    export_data.append({
+                        '时间戳': item.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                        'CPU使用率(%)': item.cpu_percent,
+                        '内存使用率(%)': item.memory_percent,
+                        '磁盘使用率(%)': item.disk_percent,
+                        '发送流量(KB)': item.network_sent / 1024,
+                        '接收流量(KB)': item.network_recv / 1024,
+                        '进程ID': item.process_id,
+                        '进程名称': item.process_name,
+                        '节点名称': item.node_name
+                    })
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+        
+        elif data_type == '测试运行记录':
+            # 导出测试运行记录
+            start_time = params['start_time']
+            end_time = params['end_time']
+            data = storage_service.get_test_runs_by_time_range(start_time, end_time)
+            
+            if export_format == 'CSV':
+                with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    # 写入表头
+                    writer.writerow(['运行ID', '开始时间', '结束时间', '状态', '总测试数', '通过数', '失败数', '跳过数', '测试路径', '报告路径', '节点名称', '退出码', '执行类型'])
+                    # 写入数据
+                    for item in data:
+                        writer.writerow([
+                            item.run_id,
+                            item.start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                            item.end_time.strftime('%Y-%m-%d %H:%M:%S') if item.end_time else '',
+                            item.status,
+                            item.total_tests,
+                            item.passed_tests,
+                            item.failed_tests,
+                            item.skipped_tests,
+                            item.test_path,
+                            item.report_path or '',
+                            item.node_name,
+                            item.exit_code or '',
+                            item.execution_type
+                        ])
+            else:  # JSON
+                export_data = []
+                for item in data:
+                    export_data.append({
+                        '运行ID': item.run_id,
+                        '开始时间': item.start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        '结束时间': item.end_time.strftime('%Y-%m-%d %H:%M:%S') if item.end_time else '',
+                        '状态': item.status,
+                        '总测试数': item.total_tests,
+                        '通过数': item.passed_tests,
+                        '失败数': item.failed_tests,
+                        '跳过数': item.skipped_tests,
+                        '测试路径': item.test_path,
+                        '报告路径': item.report_path or '',
+                        '节点名称': item.node_name,
+                        '退出码': item.exit_code or '',
+                        '执行类型': item.execution_type
+                    })
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+        
+        elif data_type == '测试日志':
+            # 这里需要获取所有测试日志，或者提供测试ID选择
+            # 为简化实现，先导出最近的1000条日志
+            with sqlite3.connect(settings.DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT run_id, timestamp, level, message FROM test_logs ORDER BY timestamp DESC LIMIT 1000')
+                data = cursor.fetchall()
+            
+            if export_format == 'CSV':
+                with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    # 写入表头
+                    writer.writerow(['运行ID', '时间戳', '日志级别', '消息'])
+                    # 写入数据
+                    for item in data:
+                        writer.writerow([
+                            item[0],
+                            datetime.fromisoformat(item[1]).strftime('%Y-%m-%d %H:%M:%S'),
+                            item[2],
+                            item[3]
+                        ])
+            else:  # JSON
+                export_data = []
+                for item in data:
+                    export_data.append({
+                        '运行ID': item[0],
+                        '时间戳': datetime.fromisoformat(item[1]).strftime('%Y-%m-%d %H:%M:%S'),
+                        '日志级别': item[2],
+                        '消息': item[3]
+                    })
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+        
+        elif data_type == '机器配置':
+            # 导出机器配置
+            from app.services import remote_machine_service
+            data = remote_machine_service.get_all_machines()
+            
+            if export_format == 'CSV':
+                with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    # 写入表头
+                    writer.writerow(['机器ID', '名称', '主机', '端口', '平台', '用户名', '状态', '描述'])
+                    # 写入数据
+                    for item in data:
+                        writer.writerow([
+                            item.machine_id,
+                            item.name,
+                            item.host,
+                            item.port,
+                            'Linux' if item.platform == 'linux' else 'Windows',
+                            item.username,
+                            item.status,
+                            item.description or ''
+                        ])
+            else:  # JSON
+                export_data = []
+                for item in data:
+                    export_data.append({
+                        '机器ID': item.machine_id,
+                        '名称': item.name,
+                        '主机': item.host,
+                        '端口': item.port,
+                        '平台': 'Linux' if item.platform == 'linux' else 'Windows',
+                        '用户名': item.username,
+                        '状态': item.status,
+                        '描述': item.description or ''
+                    })
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+        
+        return file_path
+    
     def run(self):
         """运行应用"""
         # 启动系统监控服务
@@ -273,6 +586,45 @@ class RemoteTestMonitorApp:
                 
             except Exception as e:
                 ui.label(f'读取报告失败: {str(e)}').classes('text-red-500 text-xl')
+        
+        # 定义导出文件下载路由
+        @ui.page('/export/{filename}')
+        def export_download_page(filename: str):
+            """导出文件下载页面"""
+            import fastapi
+            import urllib.parse
+            
+            # 先对URL编码的文件名进行解码，得到原始文件名
+            decoded_filename = urllib.parse.unquote(filename)
+            
+            # 构建导出文件的完整路径
+            export_dir = os.path.join(os.getcwd(), 'export')
+            file_path = os.path.join(export_dir, decoded_filename)
+            
+            # 检查文件是否存在
+            if not os.path.exists(file_path):
+                return ui.label('文件不存在').classes('text-red-500 text-xl')
+            
+            try:
+                # 使用FastAPI的Response直接返回文件内容，完全控制响应头
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                
+                # 构建符合RFC 5987标准的Content-Disposition头
+                encoded_filename = urllib.parse.quote(decoded_filename)
+                # 使用filename*=charset''encoded-filename格式，两个单引号是必须的分隔符
+                content_disposition = f'attachment; filename*=UTF-8\'\'{encoded_filename}'
+                
+                return fastapi.Response(
+                    content=content,
+                    media_type='application/octet-stream',
+                    headers={
+                        'Content-Disposition': content_disposition,
+                        'Content-Length': str(len(content))
+                    }
+                )
+            except Exception as e:
+                return ui.label(f'下载失败: {str(e)}').classes('text-red-500 text-xl')
         
         # 定义页面路由
         @ui.page('/')
@@ -323,6 +675,7 @@ class RemoteTestMonitorApp:
                     system_tab = ui.tab('🖥️ 系统监控').classes('text-base font-medium')
                     test_tab = ui.tab('🧪 测试监控').classes('text-base font-medium')
                     log_tab = ui.tab('📋 日志').classes('text-base font-medium')
+                    export_tab = ui.tab('📊 导出').classes('text-base font-medium')
                 
                 with ui.tab_panels(tabs, value=system_tab).classes('w-full'):
                     # 系统监控面板
@@ -336,6 +689,10 @@ class RemoteTestMonitorApp:
                     # 日志面板
                     with ui.tab_panel(log_tab):
                         self._create_log_panel()
+                    
+                    # 导出面板
+                    with ui.tab_panel(export_tab):
+                        self._create_export_panel()
             else:
                 # 未认证，显示登录界面
                 self._show_login_page()
